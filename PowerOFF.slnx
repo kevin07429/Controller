@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="PowerOFF/PowerOFF.vcxproj" Id="d7a9f6cc-aa7c-469b-a521-61433770c15e" />
+</Solution>
