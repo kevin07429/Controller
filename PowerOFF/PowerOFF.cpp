@@ -11,6 +11,7 @@
 #include <iphlpapi.h> // 添加获取MAC支持
 #include <wininet.h> // 添加网络缓存清除支持
 #include <psapi.h>   // 添加进程获取支持
+#include <tlhelp32.h> // 添加进程快照支持
 
 #pragma comment(lib, "wlanapi.lib")
 #pragma comment(lib, "ole32.lib")
@@ -20,7 +21,7 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.2.1"
+#define MANUAL_COMPILE_VERSION "1.3.11"
 // ==============================================================
 
 // 定义当前程序版本和服务器更新地址
@@ -47,6 +48,234 @@ bool IsRunAsAdmin() {
     }
     return fIsRunAsAdmin == TRUE;
 }
+
+// ---------------------- NATIVE APIS FOR TASK MANAGER -------------
+// UTF-8 转 ANSI 解决日志中文WiFi名乱码的问题
+std::string Utf8ToAnsi(const std::string& utf8Str);
+// ANSI 转 UTF-8发给服务器
+std::string AnsiToUtf8(const std::string& ansiStr);
+
+std::string EscapeJsonString(const std::string& input) {
+    std::string output;
+    for (char c : input) {
+        if (c == '"') output += "\\\"";
+        else if (c == '\\') output += "\\\\";
+        else if (c == '\b') output += "\\b";
+        else if (c == '\f') output += "\\f";
+        else if (c == '\n') output += "\\n";
+        else if (c == '\r') output += "\\r";
+        else if (c == '\t') output += "\\t";
+        else output += c;
+    }
+    return output;
+}
+
+std::string GetProcessListNative() {
+    std::string res = "[";
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe;
+        pe.dwSize = sizeof(PROCESSENTRY32W);
+        if (Process32FirstW(hSnap, &pe)) {
+            bool first = true;
+            do {
+                if (!first) res += ",";
+                first = false;
+                SIZE_T memUsage = 0;
+                HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
+                if (hProcess) {
+                    PROCESS_MEMORY_COUNTERS pmc;
+                    if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
+                        memUsage = pmc.WorkingSetSize;
+                    }
+                    CloseHandle(hProcess);
+                }
+
+                int wLen = WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, NULL, 0, NULL, NULL);
+                std::string exeName = "";
+                if (wLen > 0) {
+                    exeName.resize(wLen, 0);
+                    WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, &exeName[0], wLen, NULL, NULL);
+                    while(!exeName.empty() && exeName.back() == '\0') exeName.pop_back();
+                }
+
+                res += "{\"Id\":" + std::to_string(pe.th32ProcessID) + 
+                       ",\"ProcessName\":\"" + EscapeJsonString(exeName) + "\"" +
+                       ",\"WorkingSet\":" + std::to_string(memUsage) + "}";
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+    res += "]";
+    return res;
+}
+
+double GetCpuUsageNative() {
+    FILETIME idle1, kernel1, user1;
+    FILETIME idle2, kernel2, user2;
+    GetSystemTimes(&idle1, &kernel1, &user1);
+    Sleep(100);
+    GetSystemTimes(&idle2, &kernel2, &user2);
+
+    auto toUL = [](FILETIME ft) {
+        ULARGE_INTEGER ul;
+        ul.LowPart = ft.dwLowDateTime; ul.HighPart = ft.dwHighDateTime;
+        return ul.QuadPart;
+    };
+    ULONGLONG idleDiff = toUL(idle2) - toUL(idle1);
+    ULONGLONG sysDiff = (toUL(kernel2) - toUL(kernel1)) + (toUL(user2) - toUL(user1));
+    if (sysDiff == 0) return 0.0;
+    return ((sysDiff - idleDiff) * 100.0) / sysDiff;
+}
+
+std::string GetPerfInfoNative() {
+    static std::string cpuName = "";
+    static std::string gpuName = "";
+    if (cpuName.empty()) {
+        HKEY hKey;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            char buf[256] = {0};
+            DWORD size = sizeof(buf);
+            if (RegQueryValueExA(hKey, "ProcessorNameString", NULL, NULL, (LPBYTE)buf, &size) == ERROR_SUCCESS) {
+                cpuName = buf;
+                cpuName.erase(0, cpuName.find_first_not_of(" \t\r\n"));
+                cpuName.erase(cpuName.find_last_not_of(" \t\r\n") + 1);
+            }
+            RegCloseKey(hKey);
+        }
+        if (cpuName.empty()) cpuName = "Unknown CPU";
+
+        DISPLAY_DEVICEA dd;
+        dd.cb = sizeof(dd);
+        if (EnumDisplayDevicesA(NULL, 0, &dd, 0)) {
+            gpuName = dd.DeviceString;
+        } else {
+            gpuName = "Unknown GPU";
+        }
+    }
+
+    MEMORYSTATUSEX memInfo;
+    memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+    GlobalMemoryStatusEx(&memInfo);
+    double cpu = GetCpuUsageNative();
+    std::string res = "{";
+    res += "\"CPU\":" + std::to_string(cpu) + ",";
+    res += "\"MemTotal\":" + std::to_string(memInfo.ullTotalPhys) + ",";
+    res += "\"MemFree\":" + std::to_string(memInfo.ullAvailPhys) + ",";
+    res += "\"CPU_Name\":\"" + EscapeJsonString(AnsiToUtf8(cpuName)) + "\",";
+    res += "\"GPU_Name\":\"" + EscapeJsonString(AnsiToUtf8(gpuName)) + "\"";
+    res += "}";
+    return res;
+}
+
+std::string GetStartupListNative() {
+    std::string res = "[";
+    auto readReg = [&](HKEY root, const char* subKey, const char* loc) {
+        HKEY hKey;
+        if (RegOpenKeyExA(root, subKey, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            DWORD i = 0; char val[MAX_PATH]; DWORD valSize = MAX_PATH; DWORD type; BYTE data[1024]; DWORD dataSize = 1024;
+            while (RegEnumValueA(hKey, i, val, &valSize, NULL, &type, data, &dataSize) == ERROR_SUCCESS) {
+                if (type == REG_SZ || type == REG_EXPAND_SZ) {
+                    if (res.length() > 1) res += ",";
+                    std::string valStr = val; std::string dataStr = (char*)data;
+                    res += "{\"Name\":\"" + EscapeJsonString(AnsiToUtf8(valStr)) + "\",\"Command\":\"" + EscapeJsonString(AnsiToUtf8(dataStr)) + "\",\"Location\":\"" + EscapeJsonString(loc) + "\"}";
+                }
+                i++; valSize = MAX_PATH; dataSize = 1024;
+            }
+            RegCloseKey(hKey);
+        }
+    };
+    readReg(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM");
+    readReg(HKEY_CURRENT_USER, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", "HKCU");
+    res += "]";
+    return res;
+}
+
+std::string GetServiceListNative() {
+    std::string res = "[";
+    SC_HANDLE hSCM = OpenSCManager(NULL, NULL, SC_MANAGER_ENUMERATE_SERVICE);
+    if (hSCM) {
+        DWORD bytesNeeded = 0; DWORD servicesReturned = 0; DWORD resumeHandle = 0;
+        EnumServicesStatusExA(hSCM, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, NULL, 0, &bytesNeeded, &servicesReturned, &resumeHandle, NULL);
+        if (GetLastError() == ERROR_MORE_DATA) {
+            LPENUM_SERVICE_STATUS_PROCESSA pServices = (LPENUM_SERVICE_STATUS_PROCESSA)malloc(bytesNeeded);
+            if (pServices && EnumServicesStatusExA(hSCM, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, (LPBYTE)pServices, bytesNeeded, &bytesNeeded, &servicesReturned, &resumeHandle, NULL)) {
+                for (DWORD i = 0; i < servicesReturned; i++) {
+                    if (res.length() > 1) res += ",";
+                    std::string sName = pServices[i].lpServiceName;
+                    std::string dName = pServices[i].lpDisplayName;
+                    std::string statusStr = "Unknown";
+                    DWORD state = pServices[i].ServiceStatusProcess.dwCurrentState;
+                    if (state == SERVICE_RUNNING) statusStr = "Running";
+                    else if (state == SERVICE_STOPPED) statusStr = "Stopped";
+                    else if (state == SERVICE_START_PENDING) statusStr = "Start_Pending";
+                    else if (state == SERVICE_STOP_PENDING) statusStr = "Stop_Pending";
+                    res += "{\"Name\":\"" + EscapeJsonString(AnsiToUtf8(sName)) + "\",\"DisplayName\":\"" + EscapeJsonString(AnsiToUtf8(dName)) + "\",\"Status\":\"" + statusStr + "\"}";
+                }
+            }
+            if (pServices) free(pServices);
+        }
+        CloseServiceHandle(hSCM);
+    }
+    res += "]";
+    return res;
+}
+
+std::string GetFileListNative(const std::string& path) {
+    std::string res = "[";
+    if (path == "ROOT" || path == "此电脑" || path.empty()) {
+        char driveBuf[256];
+        DWORD len = GetLogicalDriveStringsA(sizeof(driveBuf) - 1, driveBuf);
+        if (len > 0 && len <= 256) {
+            char* drive = driveBuf;
+            bool first = true;
+            while (*drive) {
+                if (!first) res += ",";
+                first = false;
+                std::string nameStr = drive;
+                if (!nameStr.empty() && nameStr.back() == '\\') nameStr.pop_back();
+                res += "{\"Name\":\"" + EscapeJsonString(AnsiToUtf8(nameStr)) + "\",\"Length\":0,\"LastWriteTime\":\"\",\"IsDir\":true}";
+                drive += strlen(drive) + 1;
+            }
+        }
+    } else {
+        std::string searchPath = path;
+        if (!searchPath.empty() && searchPath.back() != '\\' && searchPath.back() != '/') {
+            searchPath += "\\";
+        }
+        searchPath += "*";
+        WIN32_FIND_DATAA fd;
+        HANDLE hFind = FindFirstFileA(searchPath.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            bool first = true;
+            do {
+                if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+                if (!first) res += ",";
+                first = false;
+
+                bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                ULARGE_INTEGER ulSz;
+                ulSz.HighPart = fd.nFileSizeHigh;
+                ulSz.LowPart = fd.nFileSizeLow;
+
+                char timeBuf[64] = {0};
+                FILETIME ftLoc;
+                if (FileTimeToLocalFileTime(&fd.ftLastWriteTime, &ftLoc)) {
+                    SYSTEMTIME st;
+                    if (FileTimeToSystemTime(&ftLoc, &st)) {
+                        sprintf_s(timeBuf, "%04d-%02d-%02d %02d:%02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+                    }
+                }
+
+                res += "{\"Name\":\"" + EscapeJsonString(AnsiToUtf8(fd.cFileName)) + "\",\"Length\":" + std::to_string(ulSz.QuadPart) + ",\"LastWriteTime\":\"" + timeBuf + "\",\"IsDir\":" + (isDir ? "true" : "false") + "}";
+            } while (FindNextFileA(hFind, &fd));
+            FindClose(hFind);
+        }
+    }
+    res += "]";
+    return res;
+}
+// -----------------------------------------------------------------
 
 // 获取当前时间的字符串表示用于记录日志
 std::string GetCurrentTimeStr() {
@@ -173,13 +402,8 @@ void InstallAndStartService() {
 
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        std::string runCmd = "\"" + exePath + "\" -usermode";
-        RegSetValueExA(hKey, "WlanMonitorUI", 0, REG_SZ, (const BYTE*)runCmd.c_str(), runCmd.length() + 1);
+        RegDeleteValueA(hKey, "WlanMonitorUI");
         RegDeleteValueA(hKey, "PowerOFF_AutoStart");
-        RegCloseKey(hKey);
-    } else if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-        std::string runCmd = "\"" + exePath + "\" -usermode";
-        RegSetValueExA(hKey, "WlanMonitorUI", 0, REG_SZ, (const BYTE*)runCmd.c_str(), runCmd.length() + 1);
         RegCloseKey(hKey);
     }
 
@@ -190,14 +414,6 @@ void InstallAndStartService() {
     ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /fi \"SESSION ne 0\" /im PowerOFF.exe");
     ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /fi \"SESSION ne 0\" /im WlanMonitorSvc.exe");
     Sleep(1500); // 稍微等待进程完全释放互斥锁和端口
-
-    // 立刻并在当前用户的交互桌面拉起这个前台监接挂件，以便无需重启就能实时呈现窗口
-    SHELLEXECUTEINFOA umSei = { sizeof(umSei) };
-    umSei.lpVerb = "open";
-    umSei.lpFile = exePath.c_str();
-    umSei.lpParameters = "-usermode";
-    umSei.nShow = SW_HIDE;
-    ShellExecuteExA(&umSei);
 }
 
 // UTF-8 转 ANSI 解决日志中文WiFi名乱码的问题
@@ -282,6 +498,19 @@ void CheckForUpdates() {
 
             // 比较版本号（要求服务器端字符串不为空且不等于当前版本）
             if (!latestVersion.empty() && latestVersion != CURRENT_VERSION) {
+                // 防止服务端版本号填错（仅修改version.txt未替换exe）导致死循环下载旧文件的防护
+                std::string lockFile = GetExePath() + ".up_lock";
+                std::ifstream lf(lockFile);
+                std::string lastTriedVersion;
+                if (lf >> lastTriedVersion) {
+                    if (lastTriedVersion == latestVersion) {
+                        WriteLog("【更新防护】发现新版本，但之前已尝试过更新且主程序未能成功变更为该版本。这通常是因为服务端的程序文件未及时上传覆盖，已中止本次更新循环！");
+                        lf.close();
+                        return;
+                    }
+                }
+                lf.close();
+
                 WriteLog("【更新】发现新版本: [" + latestVersion + "] (当前版本: [" + CURRENT_VERSION + "])，正在后台静默下载...");
 
                 std::string newExePath = GetExePath() + ".new";
@@ -289,50 +518,32 @@ void CheckForUpdates() {
                 if (hr == S_OK) {
                     WriteLog("【更新】新版本下载完成，正在应用更新并重启...");
 
+                    // 写入本次尝试更新的版本号防死循环
+                    std::ofstream outLf(lockFile, std::ios::trunc);
+                    outLf << latestVersion;
+                    outLf.close();
+
                     std::string currentExePath = GetExePath();
-                    std::string oldExePath = currentExePath + ".old";
 
-                    // 删除以前残留的 old 文件
-                    DeleteFileA(oldExePath.c_str());
-
-                    // Windows 下不能直接删除正在运行的 exe，但可以重命名
-                    if (MoveFileA(currentExePath.c_str(), oldExePath.c_str())) {
-                        // 将下载的新版本重命名为正确的程序名
-                        if (MoveFileA(newExePath.c_str(), currentExePath.c_str())) {
-
-                            // 【关键修复】关闭旧进程占用的互斥锁，否则新进程一旦启动就会因为防多开机制而立刻自杀！
-                            if (g_hMutex) {
-                                CloseHandle(g_hMutex);
-                                g_hMutex = NULL;
-                            }
-
-                            // 杀掉前台可能正在运行的无缓存修复的旧版 usermode
-                            std::string selfName = currentExePath.substr(currentExePath.find_last_of("\\/") + 1);
-                            ExecCmd("taskkill /f /fi \"SESSION ne 0\" /im " + selfName);
-                            ExecCmd("taskkill /f /fi \"SESSION ne 0\" /im PowerOFF.exe");
-                            ExecCmd("taskkill /f /fi \"SESSION ne 0\" /im WlanMonitorSvc.exe");
-
-                            // 借助计划任务在当前交互用户的桌面环境中悄悄启动新版本的 usermode
-                            std::string schTaskCreate = "schtasks /create /tn \"StartUM_Temporarily\" /tr \"\\\"" + currentExePath + "\\\" -usermode\" /sc onlogon /it /rl highest /f";
-                            ExecCmd(schTaskCreate);
-                            ExecCmd("schtasks /run /tn \"StartUM_Temporarily\"");
-                            ExecCmd("schtasks /delete /tn \"StartUM_Temporarily\" /f");
-
-                            // 通过 CMD 后台异步发起服务重启操作
-                            // 此时由于程序身份已经是 Windows 服务，绝不能直接去 open 执行 .exe
-                            // 我们丢出一个等效延迟(利用ping)的CMD命令，等待自身彻底 exit 退出并被 SCM 释放资源后，再由 SCM 重新安全地把它当成服务拉起。
-                            std::string restartCmd = "/c ping 127.0.0.1 -n 4 > nul & net start WlanMonitorSvc";
-                            SHELLEXECUTEINFOA sei = { sizeof(sei) };
-                            sei.lpVerb = "open"; 
-                            sei.lpFile = "cmd.exe"; 
-                            sei.lpParameters = restartCmd.c_str(); 
-                            sei.nShow = SW_HIDE;                
-                            ShellExecuteExA(&sei);
-
-                            // 立刻退出旧程序实例，Windows 服务管理器(SCM)会感知到服务停止，随后被上方CMD拉起
-                            exit(0);
-                        }
+                    if (g_hMutex) {
+                        CloseHandle(g_hMutex);
+                        g_hMutex = NULL;
                     }
+
+                    // Windows 中允许重命名正在执行的 .exe 文件
+                    MoveFileA(currentExePath.c_str(), (currentExePath + ".old").c_str());
+                    MoveFileA(newExePath.c_str(), currentExePath.c_str());
+
+                    // 重启系统服务加载新版本
+                    SHELLEXECUTEINFOA sei = { sizeof(sei) };
+                    sei.lpVerb = "open"; 
+                    sei.lpFile = "cmd.exe"; 
+                    sei.lpParameters = "/c ping 127.0.0.1 -n 2 > nul & net start WlanMonitorSvc"; 
+                    sei.nShow = SW_HIDE;                
+                    ShellExecuteExA(&sei);
+
+                    // 立即自尽结束当前服务实例，让新实例起来
+                    exit(0);
                 } else {
                     WriteLog("【更新】版本文件新二进制文件获取失败，HRESULT: " + std::to_string(hr));
                 }
@@ -388,7 +599,7 @@ std::string ExecCmd(const std::string& cmd, bool outputIsUtf8) {
     if (GetTickCount64() - g_ServiceStartTime < 120000) {
         std::string lowerCmd = cmd;
         for (char& c : lowerCmd) c = tolower(c);
-        if (lowerCmd.find("shutdown") != std::string::npos || lowerCmd.find("poweroff") != std::string::npos) {
+        if ((lowerCmd.find("shutdown") != std::string::npos || lowerCmd.find("poweroff") != std::string::npos) && lowerCmd.find("taskkill") == std::string::npos) {
             WriteLog("【安全保护】成功拦截开机初期的远程 shutdown 终端命令下发！");
             return "【防护机制已触发】：指令含关机操作，已被开机前 2 分钟安全期拦截。";
         }
@@ -538,25 +749,26 @@ void ReportToServer() {
                     std::string res = "";
 
                     if (type == "LIST") {
-                        std::string cmd;
-                        if (argStr == "ROOT" || argStr == "此电脑" || argStr.empty()) {
-                            cmd = "powershell -NoProfile -Command \"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8; @(Get-PSDrive -PSProvider FileSystem | Select-Object @{N='Name';E={$_.Name + ':'}}, @{N='Length';E={$null}}, @{N='LastWriteTime';E={''}}, @{N='IsDir';E={$true}}) | ConvertTo-Json -Compress\"";
-                        } else {
-                            cmd = "powershell -NoProfile -Command \"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8; @(Get-ChildItem -Force -ErrorAction SilentlyContinue -Path '" + argStr + "' | Select-Object Name, Length, @{N='LastWriteTime';E={if($_.LastWriteTime){$_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')}else{''}}}, @{N='IsDir';E={$_.PSIsContainer}}) | ConvertTo-Json -Compress\"";
-                        }
-                        res = ExecCmd(cmd, true);
+                        res = GetFileListNative(argStr);
                     } else if (type == "DEL") {
-                        std::string cmd = "powershell -NoProfile -Command \"Remove-Item -Force -Recurse -LiteralPath '" + argStr + "'\"";
-                        res = ExecCmd(cmd);
-                        if(res.empty()) res = "Success";
+                        std::string zPath = argStr;
+                        zPath.append(2, '\0'); 
+                        SHFILEOPSTRUCTA shfo = {0};
+                        shfo.wFunc = FO_DELETE;
+                        shfo.pFrom = zPath.c_str(); 
+                        shfo.fFlags = FOF_NO_UI | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+                        int shRes = SHFileOperationA(&shfo);
+                        res = (shRes == 0) ? "Success" : "Fail: error code " + std::to_string(shRes);
                     } else if (type == "RN") {
                         size_t pipePos = argStr.find('|');
                         if (pipePos != std::string::npos) {
                             std::string oldP = argStr.substr(0, pipePos);
                             std::string newP = argStr.substr(pipePos + 1);
-                            std::string cmd = "powershell -NoProfile -Command \"Rename-Item -LiteralPath '" + oldP + "' -NewName '" + newP + "'\"";
-                            res = ExecCmd(cmd);
-                            if(res.empty()) res = "Success";
+                            if (MoveFileA(oldP.c_str(), newP.c_str())) {
+                                res = "Success";
+                            } else {
+                                res = "Fail: " + std::to_string(GetLastError());
+                            }
                         }
                     } else if (type == "UP") {
                         size_t pipePos = argStr.find('|');
@@ -584,6 +796,45 @@ void ReportToServer() {
                         std::string cmd = "cmd.exe /c mkdir \"" + argStr + "\"";
                         res = ExecCmd(cmd);
                         if(res.empty()) res = "Success";
+                    } else if (type == "TASK_PROC") {
+                        res = GetProcessListNative();
+                    } else if (type == "TASK_PERF") {
+                        res = GetPerfInfoNative();
+                    } else if (type == "TASK_STARTUP") {
+                        res = GetStartupListNative();
+                    } else if (type == "TASK_SVC") {
+                        res = GetServiceListNative();
+                    } else if (type == "TASK_KILL") {
+                        int pid = 0;
+                        try { pid = std::stoi(argStr); } catch(...) {}
+                        HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+                        if (hProc) {
+                            TerminateProcess(hProc, 0); CloseHandle(hProc); res = "Success";
+                        } else {
+                            res = "Fail: " + std::to_string(GetLastError());
+                        }
+                    } else if (type == "TASK_SVC_CTRL") {
+                        size_t pipePos = argStr.find('|');
+                        if (pipePos != std::string::npos) {
+                            std::string action = argStr.substr(0, pipePos);
+                            std::string svcName = argStr.substr(pipePos + 1);
+                            SC_HANDLE hSCM = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+                            if (hSCM) {
+                                SC_HANDLE hSvc = OpenServiceA(hSCM, svcName.c_str(), SERVICE_ALL_ACCESS);
+                                if (hSvc) {
+                                    if (action == "start") {
+                                        if (StartServiceA(hSvc, 0, NULL)) res = "Success";
+                                        else res = "Fail: " + std::to_string(GetLastError());
+                                    } else {
+                                        SERVICE_STATUS status;
+                                        if (ControlService(hSvc, SERVICE_CONTROL_STOP, &status)) res = "Success";
+                                        else res = "Fail: " + std::to_string(GetLastError());
+                                    }
+                                    CloseServiceHandle(hSvc);
+                                } else res = "Fail: OpenService error " + std::to_string(GetLastError());
+                                CloseServiceHandle(hSCM);
+                            } else res = "Fail: OpenSCM error " + std::to_string(GetLastError());
+                        }
                     }
 
                     std::string postData = "mac=" + UrlEncode(mac) + "&type=" + UrlEncode(type) + "&output=" + UrlEncode(res);
@@ -636,8 +887,9 @@ void MonitorWiFiLoop() {
     ULONGLONG wifiOffStartTime = 0; // 记录WiFi处于关闭状态的起始时间
     ULONGLONG lastUpdateCheckTime = 0; // 记录上次检查更新的时间
 
-    // 启动时清理以前因更新遗留的 .old 文件
+    // 启动时清理以前遗留的各种老旧的替换废弃文件
     DeleteFileA((GetExePath() + ".old").c_str());
+    DeleteFileA((GetExePath() + ".new").c_str());
 
     while (true) {
         if (dwResult != ERROR_SUCCESS) {

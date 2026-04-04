@@ -138,9 +138,9 @@ def files_page(mac):
                 <tr>
                     <th style="width:30px;"><input type="checkbox" onclick="toggleAllFiles(this)"></th>
                     <th style="width:30px;"></th>
-                    <th>名称</th>
-                    <th style="width:120px;">大小</th>
-                    <th style="width:200px;">修改时间</th>
+                    <th onclick="sortFiles('Name')" style="cursor:pointer; user-select:none;">名称 <span id="sort_Name"></span></th>
+                    <th onclick="sortFiles('Length')" style="cursor:pointer; user-select:none; width:120px;">大小 <span id="sort_Length"></span></th>
+                    <th onclick="sortFiles('LastWriteTime')" style="cursor:pointer; user-select:none; width:200px;">修改时间 <span id="sort_LastWriteTime"></span></th>
                 </tr>
             </thead>
             <tbody id="file_list">
@@ -242,6 +242,76 @@ def files_page(mac):
             let polling = false;
             let currentSelectedFile = null;
             let currentSelectedIsDir = false;
+
+            let fileSortCol = 'Name';
+            let fileSortDir = 1;
+            let currentFiles = [];
+
+            function sortFiles(col) {
+                if (fileSortCol === col) fileSortDir *= -1;
+                else { fileSortCol = col; fileSortDir = 1; }
+                renderFiles();
+            }
+
+            function renderFiles() {
+                let tb = document.getElementById('file_list');
+                tb.innerHTML = '';
+
+                ['Name', 'Length', 'LastWriteTime'].forEach(c => {
+                    let el = document.getElementById('sort_' + c);
+                    if(el) el.innerText = (c === fileSortCol) ? (fileSortDir===1 ? ' ▲' : ' ▼') : '';
+                });
+
+                let p = document.getElementById('current_path').value;
+                let reqPath = (p === "此电脑" || p === "ROOT") ? "ROOT" : p;
+
+                let sorted = [...currentFiles];
+                sorted.sort((a,b) => {
+                    if(a.IsDir && !b.IsDir) return -1;
+                    if(!a.IsDir && b.IsDir) return 1;
+                    let vA = a[fileSortCol];
+                    let vB = b[fileSortCol];
+                    if(fileSortCol==='Name' || fileSortCol==='LastWriteTime') {
+                        vA = (vA||'').toString().toLowerCase();
+                        vB = (vB||'').toString().toLowerCase();
+                    } else {
+                        vA = parseFloat(vA) || 0;
+                        vB = parseFloat(vB) || 0;
+                    }
+                    if(vA < vB) return -1 * fileSortDir;
+                    if(vA > vB) return 1 * fileSortDir;
+                    return 0;
+                });
+
+                if (reqPath !== "ROOT") {
+                    let upTr = document.createElement('tr');
+                    upTr.innerHTML = `<td></td><td class="icon">📁</td><td colspan="3">..</td>`;
+                    upTr.ondblclick = () => goUp();
+                    tb.appendChild(upTr);
+                }
+
+                sorted.forEach(f => {
+                    let tr = document.createElement('tr');
+                    let isDir = !!f.IsDir;
+                    let fullPath = combinePath(p, f.Name);
+
+                    tr.oncontextmenu = (e) => showContextMenu(e, fullPath, isDir);
+
+                    let cb = `<input type="checkbox" class="file-check" data-path="${fullPath.replace(/"/g, '&quot;')}" data-isdir="${isDir}">`;
+                    let displayIcon = isDir ? '📁' : getFileIcon(f.Name);
+                    if (reqPath === "ROOT") displayIcon = '💽';
+                    tr.innerHTML = `<td>${reqPath !== "ROOT" ? cb : ''}</td><td class="icon">${displayIcon}</td><td>${f.Name}</td><td>${isDir ? '' : formatSize(f.Length)}</td><td>${f.LastWriteTime ? (f.LastWriteTime.DateTime || f.LastWriteTime) : ''}</td>`;
+
+                    tr.querySelectorAll('td:not(:first-child)').forEach(td => {
+                        if (isDir) {
+                            td.ondblclick = () => openDir(fullPath);
+                        } else {
+                            td.ondblclick = () => { if(confirm('是否要在远程执行该文件？')) cmdExec(fullPath); };
+                        }
+                    });
+                    tb.appendChild(tr);
+                });
+            }
 
             function hideContextMenu() {
                 try { document.getElementById('context-menu').style.display = 'none'; } catch(e){}
@@ -377,8 +447,8 @@ def files_page(mac):
                 sendFileCmd("F_CMD:LIST:" + reqPath, (resText) => {
                     let tb = document.getElementById('file_list');
                     tb.innerHTML = '';
+                    currentFiles = [];
 
-                    let files = [];
                     try {
                         if (resText) resText = resText.trim();
                         let firstBracket = resText.indexOf('[');
@@ -395,50 +465,16 @@ def files_page(mac):
 
                         let parsed = JSON.parse(resText);
                         if(Array.isArray(parsed)) {
-                            files = parsed;
+                            currentFiles = parsed;
                         } else if(parsed && parsed.Name) { 
-                            files = [parsed];
+                            currentFiles = [parsed];
                         }
                     } catch(e) {
                          logDebug("❌ [JSON解析失败]: " + e);
-                         tb.innerHTML = '<tr><td colspan="4">没有可用的文件或解析结果失败</td></tr>';
+                         tb.innerHTML = '<tr><td colspan="5">没有可用的文件或解析结果失败</td></tr>';
                          return;
                     }
-
-                    files.sort((a,b) => {
-                        if(a.IsDir && !b.IsDir) return -1;
-                        if(!a.IsDir && b.IsDir) return 1;
-                        return (a.Name || '').localeCompare(b.Name || '');
-                    });
-
-                    if (reqPath !== "ROOT") {
-                        let upTr = document.createElement('tr');
-                        upTr.innerHTML = `<td></td><td class="icon">📁</td><td colspan="3">..</td>`;
-                        upTr.ondblclick = () => goUp();
-                        tb.appendChild(upTr);
-                    }
-
-                    files.forEach(f => {
-                        let tr = document.createElement('tr');
-                        let isDir = !!f.IsDir;
-                        let fullPath = combinePath(p, f.Name);
-
-                        tr.oncontextmenu = (e) => showContextMenu(e, fullPath, isDir);
-
-                        let cb = `<input type="checkbox" class="file-check" data-path="${fullPath.replace(/"/g, '&quot;')}" data-isdir="${isDir}">`;
-                        let displayIcon = isDir ? '📁' : getFileIcon(f.Name);
-                        if (reqPath === "ROOT") displayIcon = '💽';
-                        tr.innerHTML = `<td>${reqPath !== "ROOT" ? cb : ''}</td><td class="icon">${displayIcon}</td><td>${f.Name}</td><td>${isDir ? '' : formatSize(f.Length)}</td><td>${f.LastWriteTime ? (f.LastWriteTime.DateTime || f.LastWriteTime) : ''}</td>`;
-
-                        tr.querySelectorAll('td:not(:first-child)').forEach(td => {
-                            if (isDir) {
-                                td.ondblclick = () => openDir(fullPath);
-                            } else {
-                                td.ondblclick = () => { if(confirm('是否要在远程执行该文件？')) cmdExec(fullPath); };
-                            }
-                        });
-                        tb.appendChild(tr);
-                    });
+                    renderFiles();
                 });
                 } catch(topE) { logDebug("❌ [JS异常]: " + topE); }
             }
@@ -859,6 +895,354 @@ def terminal_page(mac):
     """
     return render_template_string(TERMINAL_HTML, mac=mac, info=clients_db[mac])
 
+@app.route('/taskmgr/<mac>')
+def taskmgr_page(mac):
+    if not session.get('logged_in'): return redirect(url_for('login'))
+    if mac not in clients_db: return "设备不存在"
+
+    TASKMGR_HTML = r"""
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <title>任务管理器 - {{ info.name }} ({{ mac }})</title>
+        <style>
+            body { background: #f0f2f5; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; padding: 20px; margin: 0; }
+            .header { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-bottom: 10px; display: flex; justify-content: space-between; }
+            .header a { color: #007bff; text-decoration: none; }
+            .tabs { margin-bottom: 15px; }
+            .tabs button { padding: 8px 15px; margin-right: 5px; cursor: pointer; border: 1px solid #ccc; background: #e9ecef; border-radius: 4px; font-weight: bold; }
+            .tabs button.active { background: #007bff; color: white; border-color: #007bff; }
+            table { width: 100%; border-collapse: collapse; background: white; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); font-size: 14px; }
+            th, td { padding: 8px; border-bottom: 1px solid #ddd; text-align: left; }
+            th { background: #f8f9fa; position: sticky; top: 0; }
+            tr:hover { background: #e2e6ea; }
+            #loading { color: red; font-weight: bold; display: none; margin-left: 15px; }
+            .btn-danger { background: #dc3545; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; }
+            .btn-success { background: #28a745; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; }
+            .content-wrapper { height: calc(100vh - 120px); overflow-y: auto; }
+            .metric-box { background: white; padding: 15px; border-radius: 5px; margin-bottom: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); display: inline-block; width: 45%; margin-right: 2%; vertical-align: top;}
+            .metric-title { font-size: 18px; color: #555; }
+            .metric-value { font-size: 28px; font-weight: bold; color: #007bff; margin-top: 10px; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <span>📊 {{ info.name }} [{{ mac }}] - 远程任务管理器 <span id="conn_status"></span> <span id="loading">加载中...</span></span>
+            <a href="/">[ 返回设备列表 ]</a>
+        </div>
+        <div class="tabs">
+            <button id="tab_proc" class="active" onclick="switchTab('proc')">进程</button>
+            <button id="tab_perf" onclick="switchTab('perf')">性能</button>
+            <button id="tab_startup" onclick="switchTab('startup')">启动应用</button>
+            <button id="tab_svc" onclick="switchTab('svc')">服务</button>
+            <button onclick="refreshCurrentTab()" style="background:#17a2b8; color:white; border:none; float:right;">↻ 刷新当前页面</button>
+        </div>
+
+        <div class="content-wrapper" id="content_area">
+            <!-- Content dynamically generated -->
+        </div>
+
+        <script>
+            function checkPing() {
+                fetch('/api/ping/{{ mac }}')
+                .then(r => r.json())
+                .then(data => {
+                    let st = document.getElementById('conn_status');
+                    if(data.status === 'online') { st.innerHTML = '🟢 实时设备在线'; st.style.color = '#28a745'; } 
+                    else { st.innerHTML = '🔴 设备疑似掉线'; st.style.color = 'red'; }
+                });
+            }
+            setInterval(checkPing, 3000); checkPing();
+
+            let currentTab = 'proc';
+            let polling = false;
+
+            let procData = [];
+            let procSortCol = 'WorkingSet';
+            let procSortDir = -1;
+
+            function sortProc(col) {
+                if(procSortCol === col) procSortDir *= -1;
+                else { procSortCol = col; procSortDir = 1; }
+                renderProc();
+            }
+
+            function renderProc() {
+                let sorted = [...procData];
+                sorted.sort((a,b) => {
+                    let valA = a[procSortCol];
+                    let valB = b[procSortCol];
+                    if(procSortCol === 'ProcessName') {
+                        valA = (valA||'').toString().toLowerCase();
+                        valB = (valB||'').toString().toLowerCase();
+                    } else {
+                        valA = parseFloat(valA)||0;
+                        valB = parseFloat(valB)||0;
+                    }
+                    if(valA < valB) return -1 * procSortDir;
+                    if(valA > valB) return 1 * procSortDir;
+                    return 0;
+                });
+
+                let html = `<table><thead><tr>
+                    <th onclick="sortProc('Id')" style="cursor:pointer; user-select:none;">PID ${procSortCol==='Id'?(procSortDir===1?'▲':'▼'):''}</th>
+                    <th onclick="sortProc('ProcessName')" style="cursor:pointer; user-select:none;">进程名称 ${procSortCol==='ProcessName'?(procSortDir===1?'▲':'▼'):''}</th>
+                    <th onclick="sortProc('WorkingSet')" style="cursor:pointer; user-select:none;">内存使用 ${procSortCol==='WorkingSet'?(procSortDir===1?'▲':'▼'):''}</th>
+                    <th>说明</th><th>操作</th></tr></thead><tbody>`;
+                sorted.forEach(p => {
+                    html += `<tr><td>${p.Id}</td><td style="font-weight:bold;">${p.ProcessName}</td><td>${formatSize(p.WorkingSet)}</td><td>进程组</td><td><button class="btn-danger" onclick="killProcess(${p.Id}, '${p.ProcessName}')">结束进程</button></td></tr>`;
+                });
+                html += `</tbody></table>`;
+                let content = document.getElementById('content_area');
+                if(content) content.innerHTML = html;
+            }
+
+            let perfHistory = []; 
+            let perfInterval = null;
+
+            function drawChart() {
+                let ctx = document.getElementById('perfChart');
+                if(!ctx) return;
+                ctx = ctx.getContext('2d');
+                let w = ctx.canvas.width;
+                let h = ctx.canvas.height;
+                ctx.clearRect(0, 0, w, h);
+
+                ctx.strokeStyle = '#eee';
+                ctx.lineWidth = 1;
+                for(let i=0; i<=10; i++) {
+                    let y = (h - 20) - (i * (h - 40) / 10);
+                    ctx.beginPath(); ctx.moveTo(40, y); ctx.lineTo(w - 10, y); ctx.stroke();
+                    ctx.fillStyle = '#999'; ctx.font = '12px Arial';
+                    ctx.fillText((i*10)+'%', 5, y + 4);
+                }
+
+                if(perfHistory.length < 2) return;
+                let dx = (w - 50) / 50; 
+
+                ctx.strokeStyle = 'rgba(153, 102, 255, 1)';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                perfHistory.forEach((p, i) => {
+                    let x = 40 + i * dx;
+                    let y = (h - 20) - (p.mem / 100) * (h - 40);
+                    if(i===0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                });
+                ctx.stroke();
+
+                ctx.strokeStyle = 'rgba(54, 162, 235, 1)';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                perfHistory.forEach((p, i) => {
+                    let x = 40 + i * dx;
+                    let y = (h - 20) - (p.cpu / 100) * (h - 40);
+                    if(i===0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                });
+                ctx.stroke();
+
+                ctx.fillStyle = 'rgba(54, 162, 235, 1)'; ctx.fillRect(60, 10, 10, 10);
+                ctx.fillStyle = '#333'; ctx.fillText('CPU', 75, 20);
+                ctx.fillStyle = 'rgba(153, 102, 255, 1)'; ctx.fillRect(120, 10, 10, 10);
+                ctx.fillStyle = '#333'; ctx.fillText('内存', 135, 20);
+            }
+
+            function fetchPerfData() {
+                let fullCmd = "F_CMD:TASK_PERF:ALL";
+                fetch('/api/file/cmd', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({mac: '{{ mac }}', cmd: fullCmd})
+                }).then(() => {
+                    let tries = 0;
+                    let itv = setInterval(() => {
+                        fetch('/api/file/result/{{ mac }}')
+                        .then(r => r.json())
+                        .then(data => {
+                            if(data.status === 'ready') {
+                                clearInterval(itv);
+                                try {
+                                    let res = data.data;
+                                    let idx = res.indexOf('{');
+                                    if (idx >= 0) res = res.substring(idx);
+                                    let jdata = JSON.parse(res);
+                                    let memUsed = jdata.MemTotal - jdata.MemFree;
+                                    let memPct = ((memUsed / jdata.MemTotal) * 100).toFixed(1);
+                                    let cpuPct = jdata.CPU.toFixed(1);
+                                    let totalGB = (jdata.MemTotal / 1024 / 1024 / 1024).toFixed(1);
+                                    let usedGB = (memUsed / 1024 / 1024 / 1024).toFixed(1);
+
+                                    let cpuEl = document.getElementById('cpu_val');
+                                    if(cpuEl) cpuEl.innerText = cpuPct + ' %';
+                                    let memEl = document.getElementById('mem_val');
+                                    if(memEl) memEl.innerText = memPct + ' %';
+                                    let cNameEl = document.getElementById('cpu_name');
+                                    if(cNameEl) cNameEl.innerText = jdata.CPU_Name || 'Unknown CPU';
+                                    let gNameEl = document.getElementById('gpu_name');
+                                    if(gNameEl) gNameEl.innerText = jdata.GPU_Name || 'Unknown GPU';
+                                    let mTextEl = document.getElementById('mem_text');
+                                    if(mTextEl) mTextEl.innerText = `已用 ${usedGB} GB / 共 ${totalGB} GB`;
+
+                                    let now = new Date();
+                                    perfHistory.push({ time: now, cpu: parseFloat(cpuPct), mem: parseFloat(memPct) });
+                                    if(perfHistory.length > 50) perfHistory.shift();
+                                    drawChart();
+                                } catch(e) { console.error(e); }
+                            } else {
+                                tries++;
+                                if (tries > 20) { clearInterval(itv); }
+                            }
+                        }).catch(e => { clearInterval(itv); });
+                    }, 500);
+                }).catch(e => { });
+            }
+
+            function showLoading(show) { document.getElementById('loading').style.display = show ? 'inline' : 'none'; }
+
+            function sendNativeCommand(cmdType, arg, callback) {
+                showLoading(true);
+                let fullCmd = "F_CMD:" + cmdType + ":" + arg;
+                fetch('/api/file/cmd', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({mac: '{{ mac }}', cmd: fullCmd})
+                }).then(() => pollResult(callback)).catch(err => { showLoading(false); alert(err); });
+            }
+
+            function pollResult(callback) {
+                if(polling) return;
+                polling = true;
+                let tries = 0;
+                let itv = setInterval(() => {
+                    fetch('/api/file/result/{{ mac }}')
+                    .then(r => r.json())
+                    .then(data => {
+                        if(data.status === 'ready') {
+                            clearInterval(itv); polling = false; showLoading(false);
+                            callback(data.data);
+                        } else {
+                            tries++;
+                            if (tries > 60) { clearInterval(itv); polling = false; showLoading(false); console.error("超时"); }
+                        }
+                    }).catch(e => { clearInterval(itv); polling = false; showLoading(false); });
+                }, 500);
+            }
+
+            function formatSize(bytes) {
+                if (!bytes) return '0 MB';
+                return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+            }
+
+            function switchTab(tab) {
+                document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+                document.getElementById('tab_' + tab).classList.add('active');
+                currentTab = tab;
+                if(perfInterval) { clearInterval(perfInterval); perfInterval = null; }
+                if(currentTab === 'perf') {
+                    document.getElementById('content_area').innerHTML = `
+                         <div id="perf_layout">
+                             <div class="metric-box">
+                                 <div class="metric-title">🖥️ CPU (<span id="cpu_name" style="font-size:14px;color:#888;">获取中...</span>)</div>
+                                 <div class="metric-value" id="cpu_val">0.0 %</div>
+                             </div>
+                             <div class="metric-box">
+                                 <div class="metric-title">🧠 内存 (<span id="mem_text" style="font-size:14px;color:#888;">获取中...</span>)</div>
+                                 <div class="metric-value" id="mem_val">0.0 %</div>
+                             </div>
+                             <div class="metric-box" style="width:94%;">
+                                 <div class="metric-title">🎮 显卡 (GPU)</div>
+                                 <div class="metric-value" id="gpu_name" style="font-size:20px;">获取中...</div>
+                             </div>
+                             <div style="width:94%; margin-top:20px;"><canvas id="perfChart" width="800" height="300" style="background:#fff; border-radius:5px; box-shadow:0 1px 3px rgba(0,0,0,0.1); width:100%;"></canvas></div>
+                         </div>`;
+                    perfHistory = [];
+                    fetchPerfData();
+                    perfInterval = setInterval(fetchPerfData, 2000);
+                } else {
+                    refreshCurrentTab();
+                }
+            }
+
+            function refreshCurrentTab() {
+                if(currentTab === 'perf') {
+                    perfHistory = [];
+                    fetchPerfData();
+                    return;
+                }
+
+                let content = document.getElementById('content_area');
+                content.innerHTML = '<div style="padding:20px;text-align:center;color:#666;">⏳ 正在下发指令并获取数据中，由于数据量可能较大，请稍候...</div>';
+
+                if (currentTab === 'proc') {
+                    sendNativeCommand('TASK_PROC', 'ALL', res => {
+                        try {
+                            let idx = res.indexOf('[');
+                            if (idx >= 0) res = res.substring(idx);
+                            procData = JSON.parse(res);
+                            if(!Array.isArray(procData)) procData = [procData];
+                            renderProc();
+                        } catch(e) { content.innerHTML = "解析失败或无数据，原始返回结果日志:<br><pre style='color:red;white-space:pre-wrap;word-break:break-all;'>" + res + "</pre>"; }
+                    });
+                } else if (currentTab === 'startup') {
+                    sendNativeCommand('TASK_STARTUP', 'ALL', res => {
+                        try {
+                            let idx = res.indexOf('[');
+                            if (idx >= 0) res = res.substring(idx);
+                            let json = JSON.parse(res);
+                            if(!Array.isArray(json)) json = [json];
+                            let html = `<table><thead><tr><th>名称</th><th>启动命令</th><th>位置</th></tr></thead><tbody>`;
+                            json.forEach(s => {
+                                html += `<tr><td><b>${s.Name||''}</b></td><td style="word-break:break-all;">${s.Command||''}</td><td>${s.Location||''}</td></tr>`;
+                            });
+                            html += `</tbody></table>`;
+                            content.innerHTML = html;
+                        } catch(e) { content.innerHTML = "解析失败或暂时无直接启动项:<br><pre style='color:red;white-space:pre-wrap;word-break:break-all;'>" + res + "</pre>"; }
+                    });
+                } else if (currentTab === 'svc') {
+                    sendNativeCommand('TASK_SVC', 'ALL', res => {
+                        try {
+                            let idx = res.indexOf('[');
+                            if (idx >= 0) res = res.substring(idx);
+                            let json = JSON.parse(res);
+                            if(!Array.isArray(json)) json = [json];
+                            let html = `<table><thead><tr><th>名称</th><th>显示名称</th><th>状态</th><th>操作</th></tr></thead><tbody>`;
+                            json.forEach(s => {
+                                let stColor = s.Status === 'Running' ? 'green' : (s.Status === 'Stopped' ? 'red' : 'black');
+                                html += `<tr>
+                                    <td>${s.Name}</td><td>${s.DisplayName}</td>
+                                    <td style="color:${stColor}; font-weight:bold;">${s.Status}</td>
+                                    <td>
+                                        ${s.Status === 'Running' ? `<button class="btn-danger" onclick="ctrlSvc('${s.Name}', 'stop')">停止</button>` : `<button class="btn-success" onclick="ctrlSvc('${s.Name}', 'start')">启动</button>`}
+                                    </td>
+                                </tr>`;
+                            });
+                            html += `</tbody></table>`;
+                            content.innerHTML = html;
+                        } catch(e) { content.innerHTML = "解析服务列表失败:<br><pre style='color:red;white-space:pre-wrap;word-break:break-all;'>" + res + "</pre>"; }
+                    });
+                }
+            }
+
+            window.killProcess = function(pid, name) {
+                if(!confirm(`⚠️ 危险操作：确定强制结束进程 ${name} (PID: ${pid})？`)) return;
+                sendNativeCommand('TASK_KILL', pid.toString(), res => {
+                    refreshCurrentTab();
+                });
+            };
+
+            window.ctrlSvc = function(name, action) {
+                if(!confirm(`⚠️ 确定更改系统服务 ${name} 状态？`)) return;
+                sendNativeCommand('TASK_SVC_CTRL', action + '|' + name, res => {
+                    refreshCurrentTab();
+                });
+            };
+
+            setTimeout(() => switchTab('proc'), 500);
+
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(TASKMGR_HTML, mac=mac, info=clients_db[mac])
+
 # 抽离表格的HTML，供前端 AJAX 每隔几秒拉取实现真正的无感“实时在线状态更新”
 @app.route('/tables_partial')
 def tables_partial():
@@ -897,6 +1281,7 @@ def tables_partial():
                     <button onclick="quickCmd('{{ mac }}', 'shutdown /r /t 0')" style="background:#ffc107; color:#000; padding:4px 8px; font-size:12px;">重启</button>
                     <a href="/terminal/{{ mac }}" style="background:#007bff; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">>_ 终端</a>
                     <a href="/files/{{ mac }}" style="background:#17a2b8; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📁 文件</a>
+                    <a href="/taskmgr/{{ mac }}" style="background:#6f42c1; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📊 任务管理</a>
                 </td>
                 <td class="status-online">📡 在线</td>
             </tr>
