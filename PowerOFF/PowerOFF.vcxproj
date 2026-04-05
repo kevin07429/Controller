@@ -134,6 +134,17 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="..\Server\app.py" />
+    <None Include="..\Server\bp_auth.py" />
+    <None Include="..\Server\bp_file.py" />
+    <None Include="..\Server\bp_log.py" />
+    <None Include="..\Server\bp_main.py" />
+    <None Include="..\Server\bp_screen.py" />
+    <None Include="..\Server\bp_taskmgr.py" />
+    <None Include="..\Server\bp_terminal.py" />
+    <None Include="..\Server\core.py" />
+    <None Include="..\Server\redo.py" />
+    <None Include="..\Server\refactor.py" />
+    <None Include="..\Server\systemd_example.service" />
     <None Include="Decrypt.py" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

