@@ -38,7 +38,7 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.4.15"
+#define MANUAL_COMPILE_VERSION "1.4.16"
 // ==============================================================
 
 // 定义当前程序版本和服务器更新地址
@@ -1358,9 +1358,7 @@ int main()
 
                             ULONG quality = 60; // 修改为60极大提升画质
 
-                            // 设为非阻塞模式以实时检测服务端停止信号
-                            u_long mode = 1;
-                            ioctlsocket(sock, FIONBIO, &mode);
+                            // 保持阻塞模式，防止非阻塞导致大包图片发送不完整丢帧黑屏
 
                             while (true) {
                                 int nScreenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -1429,14 +1427,22 @@ int main()
                                 sendBuffer.append("\r\n");
 
                                 int s1 = send(sock, sendBuffer.data(), (int)sendBuffer.size(), 0);
-                                if (s1 <= 0 && WSAGetLastError() != WSAEWOULDBLOCK) break;
+                                if (s1 <= 0) break;
 
-                                char recvBuf[128];
-                                int r = recv(sock, recvBuf, sizeof(recvBuf)-1, 0);
-                                if (r > 0) {
-                                    recvBuf[r] = '\0';
-                                    if (std::string(recvBuf).find("STOP") != std::string::npos) {
-                                        break;
+                                fd_set readfds;
+                                FD_ZERO(&readfds);
+                                FD_SET(sock, &readfds);
+                                timeval tv = {0, 0}; // 设置超时为0达到非阻塞检测的作用
+                                if (select(0, &readfds, NULL, NULL, &tv) > 0) {
+                                    char recvBuf[128];
+                                    int r = recv(sock, recvBuf, sizeof(recvBuf)-1, 0);
+                                    if (r > 0) {
+                                        recvBuf[r] = '\0';
+                                        if (std::string(recvBuf).find("STOP") != std::string::npos) {
+                                            break;
+                                        }
+                                    } else {
+                                        break; // 远端关闭或错误
                                     }
                                 }
 

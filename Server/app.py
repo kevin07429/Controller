@@ -30,6 +30,19 @@ threading.Thread(target=clean_cache_task, daemon=True).start()
 USERNAME = 'gardenia'
 PASSWORD = '7852136fgU'
 
+def log_login_attempt(req, success):
+    try:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'login_log.txt')
+        time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ip = req.remote_addr or req.environ.get('HTTP_X_FORWARDED_FOR', '')
+        status = "成功" if success else "失败"
+        ua = req.headers.get('User-Agent', '')
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(f"[{time_str}] IP: {ip} | 状态: {status} | User-Agent: {ua}\n")
+    except:
+        pass
+
+
 UPDATE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(UPDATE_DIR, 'clients.json')
 
@@ -74,12 +87,20 @@ def login():
     if request.method == 'POST':
         if request.form.get('username') == USERNAME and request.form.get('password') == PASSWORD:
             session['logged_in'] = True
+            log_login_attempt(request, True)
             return redirect(url_for('index'))
         else:
+            log_login_attempt(request, False)
             return "账号或密码错误！<a href='/login'>返回重试</a>"
     return '''
-    <body style="background:#f0f2f5; font-family:sans-serif;">
-        <form method="post" style="max-width:300px; margin:100px auto; background:#fff; padding:30px; border-radius:8px; box-shadow:0 0 10px rgba(0,0,0,0.1); text-align:center;">
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body style="background:#f0f2f5; font-family:sans-serif; padding: 20px; margin: 0;">
+        <form method="post" style="max-width:300px; margin:10% auto; background:#fff; padding:30px; border-radius:8px; box-shadow:0 0 10px rgba(0,0,0,0.1); text-align:center; box-sizing: border-box; width: 100%;">
             <h2>后台管理登录</h2>
             <input type="text" name="username" placeholder="账号" style="width:100%; padding:10px; margin-bottom:15px; box-sizing:border-box;" required>
             <input type="password" name="password" placeholder="密码" style="width:100%; padding:10px; margin-bottom:15px; box-sizing:border-box;" required>
@@ -103,17 +124,19 @@ def files_page(mac):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>文件管理 - {{ info.name }} ({{ mac }})</title>
         <style>
-            body { background: #f0f2f5; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; padding: 20px; margin: 0; }
-            .header { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-bottom: 10px; display: flex; justify-content: space-between; }
-            .header a { color: #007bff; text-decoration: none; }
+            body { background: #f0f2f5; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; padding: 10px; margin: 0; }
+            .header { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-bottom: 10px; display: flex; flex-direction: column; }
+            .header a { margin-top: 10px; color: #007bff; text-decoration: none; }
             .header a:hover { text-decoration: underline; }
-            .btn { background: #007bff; color: white; border: none; padding: 5px 10px; border-radius: 3px; cursor: pointer; }
+            .btn { background: #007bff; color: white; border: none; padding: 5px 10px; border-radius: 3px; cursor: pointer; margin: 2px; }
             .btn:hover { background: #0056b3; }
-            .path-bar { display: flex; gap: 10px; margin-bottom: 10px; }
-            .path-bar input { flex-grow: 1; padding: 5px; }
-            table { width: 100%; border-collapse: collapse; background: white; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); user-select: none; }
+            .path-bar { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 10px; align-items: center; }
+            .path-bar input { flex-grow: 1; padding: 5px; min-width: 150px; }
+            .table-responsive { overflow-x: auto; }
+            table { width: 100%; min-width: 600px; border-collapse: collapse; background: white; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); user-select: none; }
             th, td { padding: 10px; border-bottom: 1px solid #ddd; text-align: left; }
             th { background: #f8f9fa; }
             tr:hover { background: #e2e6ea; cursor: pointer;}
@@ -139,11 +162,13 @@ def files_page(mac):
         </div>
 
         <div style="margin-bottom: 10px;">
-            <input type="file" id="uploadFile" style="display:inline-block; border:1px solid #ccc; padding:3px;">
+            <input type="file" id="uploadFile" style="display:inline-block; border:1px solid #ccc; padding:3px; max-width: 100%;">
+            <br><br>
             <button class="btn" onclick="uploadToServer()">上传到当前目录</button>
-            <button class="btn" onclick="cmdMkdir()" style="margin-left:20px; background:#17a2b8;">新建文件夹</button>
+            <button class="btn" onclick="cmdMkdir()" style="background:#17a2b8;">新建文件夹</button>
         </div>
 
+        <div class="table-responsive">
         <table>
             <thead>
                 <tr>
@@ -158,6 +183,7 @@ def files_page(mac):
                 <tr><td colspan="5" style="text-align:center;color:#888;">请点击“前往”以加载目录...</td></tr>
             </tbody>
         </table>
+        </div>
 
         <!-- Context Menu Template -->
         <div id="context-menu">
@@ -832,16 +858,18 @@ def terminal_page(mac):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>终端 - {{ info.name }} ({{ mac }})</title>
         <style>
-            body { background: #000; color: #00ff00; font-family: Consolas, monospace; padding: 20px; margin: 0; }
-            #output { font-family: Consolas; white-space: pre-wrap; word-wrap: break-word; padding-bottom: 20px; }
-            .header { border-bottom: 1px solid #333; padding-bottom: 10px; margin-bottom: 10px; display: flex; justify-content: space-between;}
-            .header a { color: #aaa; text-decoration: none; }
+            body { background: #000; color: #00ff00; font-family: Consolas, monospace; padding: 10px; margin: 0; }
+            #output { font-family: Consolas; white-space: pre-wrap; word-wrap: break-word; padding-bottom: 40px; }
+            .header { border-bottom: 1px solid #333; padding-bottom: 10px; margin-bottom: 10px; display: flex; flex-direction: column; }
+            .header a { color: #aaa; text-decoration: none; margin-top: 5px; }
             .header a:hover { color: #fff; }
-            .input-area { display: flex; position: fixed; bottom: 0; left: 0; right: 0; background: #111; padding: 10px; border-top: 1px solid #333; }
-            .input-area input { flex-grow: 1; background: #000; color: #00ff00; border: 1px solid #00ff00; padding: 8px; font-family: Consolas; outline: none;}
-            .input-area button { background: #00ff00; color: #000; font-weight: bold; border: none; padding: 0 20px; cursor: pointer; margin-left:10px; }
+            .input-area { display: flex; flex-wrap: wrap; position: fixed; bottom: 0; left: 0; right: 0; background: #111; padding: 10px; border-top: 1px solid #333; }
+            .input-area span { width: 100%; padding-bottom: 5px; box-sizing: border-box; font-size: 12px; }
+            .input-area input { flex-grow: 1; background: #000; color: #00ff00; border: 1px solid #00ff00; padding: 8px; font-family: Consolas; outline: none; min-width: 180px; }
+            .input-area button { background: #00ff00; color: #000; font-weight: bold; border: none; padding: 8px 15px; cursor: pointer; margin-left: 5px; margin-top: 5px;}
             .input-area button:hover { background: #00cc00; }
             .sys-msg { color: #888; }
         </style>
@@ -854,10 +882,12 @@ def terminal_page(mac):
         <div id="output"><span class="sys-msg">正在链接受控端，获取最后输出缓冲...</span></div>
         <br><br><br>
         <div class="input-area">
-            <span style="padding: 10px 5px 10px 10px;">root@{{ info.name }}:~#</span>
-            <input type="text" id="cmd" placeholder="输入CMD系统命令 (例如 whoami 或 ipconfig)，按回车发送..." onkeydown="if(event.keyCode==13) sendCmd()">
-            <button onclick="sendCmd()">发送</button>
-            <button onclick="window.location.href='/'" style="background: #6c757d; color: #fff; margin-left: 10px;">返回列表</button>
+            <span style="color:#aaa;">root@{{ info.name }}:~#</span>
+            <div style="display:flex; width: 100%;">
+                <input type="text" id="cmd" placeholder="输入命令..." onkeydown="if(event.keyCode==13) sendCmd()">
+                <button onclick="sendCmd()">发送</button>
+                <button onclick="window.location.href='/'" style="background:#6c757d; color:#fff;">返回</button>
+            </div>
         </div>
 
         <script>
@@ -924,15 +954,17 @@ def taskmgr_page(mac):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>任务管理器 - {{ info.name }} ({{ mac }})</title>
         <style>
-            body { background: #f0f2f5; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; padding: 20px; margin: 0; }
-            .header { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-bottom: 10px; display: flex; justify-content: space-between; }
-            .header a { color: #007bff; text-decoration: none; }
-            .tabs { margin-bottom: 15px; }
-            .tabs button { padding: 8px 15px; margin-right: 5px; cursor: pointer; border: 1px solid #ccc; background: #e9ecef; border-radius: 4px; font-weight: bold; }
+            body { background: #f0f2f5; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; padding: 10px; margin: 0; }
+            .header { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-bottom: 10px; display: flex; flex-direction: column; }
+            .header a { margin-top: 10px; color: #007bff; text-decoration: none; }
+            .tabs { margin-bottom: 15px; display: flex; flex-wrap: wrap; gap: 5px; }
+            .tabs button { padding: 8px 15px; cursor: pointer; border: 1px solid #ccc; background: #e9ecef; border-radius: 4px; font-weight: bold; flex-grow: 1; }
             .tabs button.active { background: #007bff; color: white; border-color: #007bff; }
-            table { width: 100%; border-collapse: collapse; background: white; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); font-size: 14px; }
+            .table-responsive { overflow-x: auto; }
+            table { width: 100%; border-collapse: collapse; background: white; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); font-size: 14px; min-width: 600px; }
             th, td { padding: 8px; border-bottom: 1px solid #ddd; text-align: left; }
             th { background: #f8f9fa; position: sticky; top: 0; }
             tr:hover { background: #e2e6ea; }
@@ -1004,7 +1036,7 @@ def taskmgr_page(mac):
                     return 0;
                 });
 
-                let html = `<table><thead><tr>
+                let html = `<div class="table-responsive"><table><thead><tr>
                     <th onclick="sortProc('Id')" style="cursor:pointer; user-select:none;">PID ${procSortCol==='Id'?(procSortDir===1?'▲':'▼'):''}</th>
                     <th onclick="sortProc('ProcessName')" style="cursor:pointer; user-select:none;">进程名称 ${procSortCol==='ProcessName'?(procSortDir===1?'▲':'▼'):''}</th>
                     <th onclick="sortProc('WorkingSet')" style="cursor:pointer; user-select:none;">内存使用 ${procSortCol==='WorkingSet'?(procSortDir===1?'▲':'▼'):''}</th>
@@ -1012,7 +1044,7 @@ def taskmgr_page(mac):
                 sorted.forEach(p => {
                     html += `<tr><td>${p.Id}</td><td style="font-weight:bold;">${p.ProcessName}</td><td>${formatSize(p.WorkingSet)}</td><td>进程组</td><td><button class="btn-danger" onclick="killProcess(${p.Id}, '${p.ProcessName}')">结束进程</button></td></tr>`;
                 });
-                html += `</tbody></table>`;
+                html += `</tbody></table></div>`;
                 let content = document.getElementById('content_area');
                 if(content) content.innerHTML = html;
             }
@@ -1207,11 +1239,11 @@ def taskmgr_page(mac):
                             if (idx >= 0) res = res.substring(idx);
                             let json = JSON.parse(res);
                             if(!Array.isArray(json)) json = [json];
-                            let html = `<table><thead><tr><th>名称</th><th>启动命令</th><th>位置</th></tr></thead><tbody>`;
+                            let html = `<div class="table-responsive"><table><thead><tr><th>名称</th><th>启动命令</th><th>位置</th></tr></thead><tbody>`;
                             json.forEach(s => {
                                 html += `<tr><td><b>${s.Name||''}</b></td><td style="word-break:break-all;">${s.Command||''}</td><td>${s.Location||''}</td></tr>`;
                             });
-                            html += `</tbody></table>`;
+                            html += `</tbody></table></div>`;
                             content.innerHTML = html;
                         } catch(e) { content.innerHTML = "解析失败或暂时无直接启动项:<br><pre style='color:red;white-space:pre-wrap;word-break:break-all;'>" + res + "</pre>"; }
                     });
@@ -1222,7 +1254,7 @@ def taskmgr_page(mac):
                             if (idx >= 0) res = res.substring(idx);
                             let json = JSON.parse(res);
                             if(!Array.isArray(json)) json = [json];
-                            let html = `<table><thead><tr><th>名称</th><th>显示名称</th><th>状态</th><th>操作</th></tr></thead><tbody>`;
+                            let html = `<div class="table-responsive"><table><thead><tr><th>名称</th><th>显示名称</th><th>状态</th><th>操作</th></tr></thead><tbody>`;
                             json.forEach(s => {
                                 let stColor = s.Status === 'Running' ? 'green' : (s.Status === 'Stopped' ? 'red' : 'black');
                                 html += `<tr>
@@ -1233,7 +1265,7 @@ def taskmgr_page(mac):
                                     </td>
                                 </tr>`;
                             });
-                            html += `</tbody></table>`;
+                            html += `</tbody></table></div>`;
                             content.innerHTML = html;
                         } catch(e) { content.innerHTML = "解析服务列表失败:<br><pre style='color:red;white-space:pre-wrap;word-break:break-all;'>" + res + "</pre>"; }
                     });
@@ -1272,7 +1304,8 @@ def tables_partial():
     
     PARTIAL_HTML = """
     <h3>🟢 活跃在线设备列表 [ {{ online_clients|length }} 台 ]</h3>
-    <table>
+    <div class="table-scroll" style="overflow-x: auto;">
+    <table style="min-width: 800px;">
         <thead>
             <tr>
                 <th><input type="checkbox" id="checkAll" onclick="toggleAll(this)"></th>
@@ -1310,6 +1343,7 @@ def tables_partial():
             {% endfor %}
         </tbody>
     </table>
+    </div>
 
     <div style="margin-bottom: 30px; background: #e9ecef; padding: 15px; border-radius: 8px;">
         <b>⚡ 批量操作 (已选设备):</b>
@@ -1319,7 +1353,8 @@ def tables_partial():
     </div>
 
     <h3>🔴 离线设备记录 [ {{ offline_clients|length }} 台 ]</h3>
-    <table>
+    <div class="table-scroll" style="overflow-x: auto;">
+    <table style="min-width: 600px;">
         <thead>
             <tr>
                 <th>MAC 地址</th>
@@ -1348,6 +1383,7 @@ def tables_partial():
             {% endfor %}
         </tbody>
     </table>
+    </div>
     """
     return render_template_string(PARTIAL_HTML, online_clients=online_clients, offline_clients=offline_clients)
 
@@ -1369,17 +1405,17 @@ def index():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>控制台设备管理</title>
         <style>
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f0f2f5; margin: 0; padding: 20px; }
-            .container { max-width: 1100px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f0f2f5; margin: 0; padding: 10px; }
+            .container { max-width: 1100px; margin: 0 auto; background: #fff; padding: 15px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
             table { width: 100%; border-collapse: collapse; margin-top: 10px; margin-bottom: 30px; user-select: none; }
-            th, td { padding: 12px 15px; border-bottom: 1px solid #ddd; text-align: left; }
+            th, td { padding: 10px 10px; border-bottom: 1px solid #ddd; text-align: left; }
             th { background-color: #007bff; color: white; }
             tr:hover { background-color: #f1f1f1; }
             .status-online { color: #28a745; font-weight: bold; }
             .status-offline { color: #dc3545; font-weight: bold; }
-            .mgmt-box { background: #e9ecef; padding: 20px; border-radius: 8px; margin-bottom: 30px; }
-            input[type="text"], input[type="file"] { padding: 8px; margin-right: 10px; border: 1px solid #ccc; border-radius:4px;}
-            button { padding: 8px 15px; background: #007bff; border: none; border-radius: 4px; cursor: pointer; color: white;}
+            .mgmt-box { background: #e9ecef; padding: 15px; border-radius: 8px; margin-bottom: 20px; overflow-wrap: break-word; }
+            input[type="text"], input[type="file"] { padding: 8px; margin-right: 10px; border: 1px solid #ccc; border-radius:4px; max-width: 100%; box-sizing: border-box; }
+            button { padding: 8px 15px; background: #007bff; border: none; border-radius: 4px; cursor: pointer; color: white; margin: 2px; }
             button:hover { background: #0056b3; }
             .logout { float: right; padding:8px 15px; background: #dc3545; border-radius: 4px; text-decoration: none; color: #fff;}
             .main-context { display: none; position: absolute; z-index: 1000; background: white; border: 1px solid #ccc; box-shadow: 2px 2px 5px rgba(0,0,0,0.2); border-radius: 4px; padding: 5px 0; min-width: 150px; }
@@ -1429,17 +1465,38 @@ def index():
         </div>
 
         <script>
+            let isUserInteracting = false;
+            window.addEventListener('touchstart', function() { isUserInteracting = true; }, {passive: true});
+            window.addEventListener('touchend', function() { setTimeout(function(){ isUserInteracting = false; }, 1000); });
+            window.addEventListener('mousedown', function() { isUserInteracting = true; });
+            window.addEventListener('mouseup', function() { setTimeout(function(){ isUserInteracting = false; }, 1000); });
+
             // 定时使用 AJAX 异步拉取表格更新，达到实时无感动态列表
             function fetchTables() {
+                if (isUserInteracting) return; // 如果用户正在进行触摸滑动操作，则暂时不刷新DOM以免打断用户
+
                 // 1. 保存当前勾选的设备MAC
                 var checkedMacs = [];
                 var checkboxes = document.querySelectorAll('.client-check:checked');
                 checkboxes.forEach(c => checkedMacs.push(c.value));
 
+                // 记录当前的表格横向滚动位置
+                var scrollContainers = document.querySelectorAll('.table-scroll');
+                var scrollPositions = [];
+                scrollContainers.forEach(c => scrollPositions.push(c.scrollLeft));
+
                 fetch('/tables_partial')
                     .then(response => response.text())
                     .then(html => {
                         document.getElementById('target-tables').innerHTML = html;
+
+                        // 恢复表格滚动的横向位置
+                        var newScrollContainers = document.querySelectorAll('.table-scroll');
+                        newScrollContainers.forEach((c, i) => {
+                            if (scrollPositions[i] !== undefined) {
+                                c.scrollLeft = scrollPositions[i];
+                            }
+                        });
 
                         // 2. 渲染新表格后恢复勾选状态
                         var newCheckboxes = document.querySelectorAll('.client-check');
@@ -1545,17 +1602,18 @@ def screen_page(mac):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>屏幕监控 - {{ info.name }} ({{ mac }})</title>
         <style>
-            body { background: #f0f2f5; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; padding: 20px; margin: 0; text-align: center; }
-            .header { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-bottom: 10px; display: flex; justify-content: space-between; text-align: left; }
-            .header a { color: #007bff; text-decoration: none; }
-            .btn { background: #007bff; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-size: 16px; margin: 10px; }
+            body { background: #f0f2f5; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; padding: 10px; margin: 0; text-align: center; }
+            .header { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-bottom: 10px; display: flex; flex-direction: column; text-align: left; }
+            .header a { color: #007bff; text-decoration: none; margin-top: 5px; }
+            .btn { background: #007bff; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-size: 16px; margin: 5px; max-width: 100%; }
             .btn:hover { background: #0056b3; }
             .btn:disabled { background: #ccc; cursor: not-allowed; }
             .btn-danger { background: #dc3545; }
             .btn-danger:hover { background: #c82333; }
-            img { max-width: 100%; max-height: 85vh; border: 1px solid #ccc; box-shadow: 0 4px 8px rgba(0,0,0,0.1); margin-top: 10px; background: #000; }
+            img { width: 100%; height: auto; max-width: 100%; border: 1px solid #ccc; box-shadow: 0 4px 8px rgba(0,0,0,0.1); margin-top: 10px; background: #000; object-fit: contain; }
         </style>
     </head>
     <body onunload="stopStream()">
@@ -1714,13 +1772,15 @@ def api_stream_fps(mac):
 
 from flask import Response
 def generate_mjpeg(mac):
+    yield b'--frame\r\n'
     last_frame = b''
     while clients_db.get(mac, {}).get('stream_active', False):
         frame = clients_db.get(mac, {}).get('stream_frame', b'')
         if frame and frame != last_frame:
             last_frame = frame
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            yield (b'Content-Type: image/jpeg\r\n'
+                   b'Content-Length: ' + str(len(frame)).encode() + b'\r\n\r\n' +
+                   frame + b'\r\n--frame\r\n')
         else:
             time.sleep(0.01)
 

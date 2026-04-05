@@ -22,4 +22,4 @@
 
 if __name__ == "__main__":
     # 替换为你实际的日志路径
-    decrypt_log("PowerOFF_Log.txt")
+    decrypt_log("WlanMonitorSvc_Log.txt")
