@@ -59,5 +59,11 @@
     <None Include="..\Server\redo.py">
       <Filter>源文件</Filter>
     </None>
+    <None Include="..\Server\bp_keylog.py">
+      <Filter>源文件</Filter>
+    </None>
+    <None Include="..\Server\bp_apps.py">
+      <Filter>源文件</Filter>
+    </None>
   </ItemGroup>
 </Project>

