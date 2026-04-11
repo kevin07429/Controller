@@ -38,7 +38,7 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.6.10"
+#define MANUAL_COMPILE_VERSION "1.6.12"
 // ==============================================================
 
 // 定义当前程序版本和服务器更新地址
@@ -743,11 +743,6 @@ std::string AnsiToUtf8(const std::string& ansiStr) {
 
 // 调用底层API进行强制关机
 void ForceShutdown() {
-    if (GetTickCount64() - g_ServiceStartTime < 120000) {
-        WriteLog("【安全保护】系统或服务启动不足2分钟，强制拦截了本次底层的关机请求，防止死循环无限重启！");
-        return;
-    }
-
     HANDLE hToken;
     TOKEN_PRIVILEGES tkp;
 
@@ -928,19 +923,6 @@ std::string UrlEncode(const std::string& str) {
 
 // 执行CMD命令并获取输出结果
 std::string ExecCmd(const std::string& cmd, bool outputIsUtf8) {
-    if (GetTickCount64() - g_ServiceStartTime < 120000) {
-        std::string lowerCmd = cmd;
-        for (char& c : lowerCmd) c = tolower((unsigned char)c);
-        if ((lowerCmd.find("shutdown") != std::string::npos || lowerCmd.find("poweroff") != std::string::npos) && lowerCmd.find("taskkill") == std::string::npos) {
-            static bool s_hasLoggedShutdownBlock = false;
-            if (!s_hasLoggedShutdownBlock) {
-                WriteLog("【安全保护】成功拦截开机初期的远程 shutdown 终端命令下发！");
-                s_hasLoggedShutdownBlock = true;
-            }
-            return "【防护机制已触发】：指令含关机操作，已被开机前 2 分钟安全期拦截。";
-        }
-    }
-
     std::string result = "";
     std::string full_cmd = "cmd.exe /c " + cmd + " 2>&1";
     std::string mutable_cmd = full_cmd; // CreateProcess需要可变的字符串指针
@@ -1387,22 +1369,23 @@ void ReportToServer() {
         reportUrl += "&kl=0";
     }
 
-    IStream* stream = NULL;
-    HRESULT hr = URLOpenBlockingStreamA(0, reportUrl.c_str(), &stream, 0, 0);
-    if (hr == S_OK && stream != NULL) {
-        char buffer[1024];
-        ULONG bytesRead;
-        std::string response = "";
-        while (SUCCEEDED(stream->Read(buffer, sizeof(buffer) - 1, &bytesRead)) && bytesRead > 0) {
-            buffer[bytesRead] = '\0';
-            response += buffer;
-        }
-        stream->Release();
+    HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (hSession) {
+        HINTERNET hConnect = InternetOpenUrlA(hSession, reportUrl.c_str(), NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_NO_UI, 0);
+        if (hConnect) {
+            char buffer[1024];
+            DWORD bytesRead = 0;
+            std::string response = "";
+            while (InternetReadFile(hConnect, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead > 0) {
+                buffer[bytesRead] = '\0';
+                response += buffer;
+            }
+            InternetCloseHandle(hConnect);
 
-        TrimString(response); // 消除可能的隐藏换行符，避免指令匹不上
+            TrimString(response); // 消除可能的隐藏换行符，避免指令匹不上
 
-        // 检测心跳回调是否携带了需要执行的操作命令
-        if (!response.empty() && response != "Missing parameters") {
+            // 检测心跳回调是否携带了需要执行的操作命令
+            if (!response.empty() && response != "Missing parameters") {
             if (response.find("SSID:") != std::string::npos) {
                 // 如果包含 SSID:XXX，则更新存入本地内存的自定义名字
                 size_t pos = response.find("SSID:");
@@ -1650,6 +1633,8 @@ void ReportToServer() {
                 UploadLogToServer();
             }
         }
+        }
+        InternetCloseHandle(hSession);
     }
 }
 
