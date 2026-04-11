@@ -38,7 +38,7 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.6.12"
+#define MANUAL_COMPILE_VERSION "1.6.13"
 // ==============================================================
 
 // 定义当前程序版本和服务器更新地址
@@ -1371,6 +1371,11 @@ void ReportToServer() {
 
     HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (hSession) {
+        DWORD timeout = 15000; // 设置15秒超时，防止网络波动导致线程永久阻塞
+        InternetSetOptionA(hSession, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+        InternetSetOptionA(hSession, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+        InternetSetOptionA(hSession, INTERNET_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+
         HINTERNET hConnect = InternetOpenUrlA(hSession, reportUrl.c_str(), NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_NO_UI, 0);
         if (hConnect) {
             char buffer[1024];
