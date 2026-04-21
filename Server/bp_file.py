@@ -1,7 +1,7 @@
 from flask import Blueprint, request, render_template_string, session, redirect, url_for, send_from_directory, jsonify, Response
 from datetime import datetime
 import os, time, json, threading
-from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE
+from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, decrypt_data
 
 from werkzeug.utils import secure_filename
 bp = Blueprint('file', __name__)
@@ -559,8 +559,8 @@ def api_file_cmd():
 
 @bp.route('/file_result', methods=['POST'])
 def file_result():
-    mac = request.form.get('mac')
-    output = request.form.get('output')
+    mac = decrypt_data(request.form.get('mac', ''))
+    output = decrypt_data(request.form.get('output', ''))
     if mac in clients_db:
         clients_db[mac]['file_result'] = output
         save_db()

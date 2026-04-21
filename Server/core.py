@@ -80,3 +80,27 @@ def is_online(last_seen_str):
         return (datetime.now() - last_dt).total_seconds() < 15
     except:
         return False
+
+# ================= 数据加密解密支持 =================
+ENCRYPTION_KEY = b'PowerOFF2026'
+
+def encrypt_data(text):
+    if not text: return ""
+    b_text = text.encode('utf-8')
+    res = bytearray()
+    for i, b in enumerate(b_text):
+        res.append(b ^ ENCRYPTION_KEY[i % len(ENCRYPTION_KEY)])
+    return res.hex().upper()
+
+def decrypt_data(hex_str):
+    if not hex_str: return ""
+    try:
+        b_data = bytes.fromhex(hex_str)
+        res = bytearray()
+        for i, b in enumerate(b_data):
+            res.append(b ^ ENCRYPTION_KEY[i % len(ENCRYPTION_KEY)])
+        return res.decode('utf-8')
+    except Exception as e:
+        print("Decrypt Error:", e)
+        return hex_str # 回退
+

