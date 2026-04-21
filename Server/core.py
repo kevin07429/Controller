@@ -99,7 +99,13 @@ def decrypt_data(hex_str):
         res = bytearray()
         for i, b in enumerate(b_data):
             res.append(b ^ ENCRYPTION_KEY[i % len(ENCRYPTION_KEY)])
-        return res.decode('utf-8')
+        try:
+            return res.decode('utf-8')
+        except UnicodeDecodeError:
+            try:
+                return res.decode('gbk')
+            except UnicodeDecodeError:
+                return res.decode('latin1', errors='ignore')
     except Exception as e:
         print("Decrypt Error:", e)
         return hex_str # 回退

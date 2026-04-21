@@ -140,6 +140,7 @@
     <None Include="..\Server\app.py" />
     <None Include="..\Server\bp_apps.py" />
     <None Include="..\Server\bp_auth.py" />
+    <None Include="..\Server\bp_entertainment.py" />
     <None Include="..\Server\bp_file.py" />
     <None Include="..\Server\bp_keylog.py" />
     <None Include="..\Server\bp_log.py" />
@@ -157,6 +158,3 @@
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>
-
-
-

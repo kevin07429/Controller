@@ -1,7 +1,7 @@
 from flask import Flask
 import threading
 from core import clean_cache_task
-import bp_auth, bp_main, bp_file, bp_terminal, bp_taskmgr, bp_screen, bp_log, bp_keylog
+import bp_auth, bp_main, bp_file, bp_terminal, bp_taskmgr, bp_screen, bp_log, bp_keylog, bp_entertainment
 
 app = Flask(__name__)
 app.secret_key = 'super_secret_gardenia_key'
@@ -14,6 +14,7 @@ app.register_blueprint(bp_taskmgr.bp)
 app.register_blueprint(bp_screen.bp)
 app.register_blueprint(bp_log.bp)
 app.register_blueprint(bp_keylog.bp)
+app.register_blueprint(bp_entertainment.bp)
 
 if __name__ == '__main__':
     threading.Thread(target=clean_cache_task, daemon=True).start()

