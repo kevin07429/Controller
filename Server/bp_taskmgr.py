@@ -233,15 +233,20 @@ def taskmgr_page(mac):
                             callback(data.data);
                         } else {
                             tries++;
-                            if (tries > 60) { clearInterval(itv); polling = false; showLoading(false); console.error("超时"); }
+                            // 增加最大重试次数以等待较长操作或稍微延迟的网络
+                            if (tries > 300) { clearInterval(itv); polling = false; showLoading(false); console.error("超时"); }
                         }
                     }).catch(e => { clearInterval(itv); polling = false; showLoading(false); });
-                }, 500);
+                }, 1000); // 增加间隔减少请求频率
             }
 
             function formatSize(bytes) {
                 if (!bytes) return '0 MB';
                 return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+            }
+
+            function scrollBottom() {
+                // optional function if needed
             }
 
             function switchTab(tab) {

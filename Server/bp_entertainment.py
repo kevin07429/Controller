@@ -113,6 +113,14 @@ def entertainment_page(mac):
             </div>
 
             <div class="section">
+                <h3>📱 短视频遥控（抖音等）</h3>
+                <p>通过模拟常见快捷键控制短视频客户端（需客户端窗口在前台）：</p>
+                <button class="btn" onclick="sendShortVideoCmd('playpause')">⏯ 暂停 / 继续（空格）</button>
+                <button class="btn" onclick="sendShortVideoCmd('next')">⏭ 下一条（↓）</button>
+                <button class="btn" onclick="sendShortVideoCmd('prev')">⏮ 上一条（↑）</button>
+            </div>
+
+            <div class="section">
                 <h3>💻 屏幕电源控制</h3>
                 <p>远程控制显示器电源状态，防止长时间挂机烧屏：</p>
                 <button class="btn btn-warning" onclick="sendCustomCmd('F_CMD:MONITOR_OFF:')">💤 关闭显示器</button>
@@ -159,6 +167,13 @@ def entertainment_page(mac):
                     let code = 179; // Play/Pause
                     if (action === 'next') code = 176; // Next Track
                     if (action === 'prev') code = 177; // Previous Track
+                    sendCmd("F_CMD:MEDIA:" + code);
+                }
+
+                function sendShortVideoCmd(action) {
+                    let code = 32; // Space: Pause/Resume
+                    if (action === 'next') code = 40; // Arrow Down: Next video
+                    if (action === 'prev') code = 38; // Arrow Up: Previous video
                     sendCmd("F_CMD:MEDIA:" + code);
                 }
 

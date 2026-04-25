@@ -449,7 +449,7 @@ def files_page(mac):
                      logDebug("成功触发下载: " + res);
                      let dlLink = "/downloads/{{ mac }}/" + encodeURIComponent(fName);
                      if(confirm("文件可能已传输至控制端缓存，是否立刻尝试下载?")) {
-                         window.open(dlLink, '_blank');
+                         window.location.href = dlLink;
                      }
                 });
             }
