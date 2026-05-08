@@ -50,19 +50,10 @@
     <None Include="..\Server\core.py">
       <Filter>源文件</Filter>
     </None>
-    <None Include="..\Server\refactor.py">
-      <Filter>源文件</Filter>
-    </None>
     <None Include="..\Server\systemd_example.service">
       <Filter>源文件</Filter>
     </None>
-    <None Include="..\Server\redo.py">
-      <Filter>源文件</Filter>
-    </None>
     <None Include="..\Server\bp_keylog.py">
-      <Filter>源文件</Filter>
-    </None>
-    <None Include="..\Server\bp_apps.py">
       <Filter>源文件</Filter>
     </None>
     <None Include="..\Server\bp_entertainment.py">

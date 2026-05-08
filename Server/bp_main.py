@@ -29,14 +29,61 @@ def report_client():
 
     if mac and ver:
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 优化：只需在设备首次上线，或者未记录IP时，服务端才去解析网络层的来访IP
+        def get_current_ip():
+            ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+            return ip.split(',')[0].strip() if ip and ',' in ip else ip
+
+        def get_ip_location(ip):
+            if not ip or ip == "127.0.0.1" or ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
+                return "局域网/本地"
+            try:
+                import urllib.request, json
+                # 使用 PConline 或其他稳定性更高的国内免费接口补全
+                req = urllib.request.Request(f"http://whois.pconline.com.cn/ipJson.jsp?ip={ip}&json=true", headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=3) as url:
+                    data = json.loads(url.read().decode('gbk'))
+                    return data.get('addr', '').strip() or "未知地区"
+            except Exception as e:
+                # 备用方案 ip-api
+                try:
+                    with urllib.request.urlopen(f"http://ip-api.com/json/{ip}?lang=zh-CN", timeout=3) as url:
+                        data = json.loads(url.read().decode())
+                        if data.get("status") == "success":
+                            return f"{data.get('country', '')} {data.get('regionName', '')} {data.get('city', '')}".strip()
+                except:
+                    pass
+            return "解析失败"
+
         if mac not in clients_db:
-            clients_db[mac] = {"name": "未命名设备", "ver": ver, "last_seen": time_str, "fg": fg, "kl": kl, "encrypted": is_encrypted}
+            new_ip = get_current_ip()
+            clients_db[mac] = {"name": "未命名设备", "ver": ver, "last_seen": time_str, "fg": fg, "kl": kl, "encrypted": is_encrypted, "ip": new_ip, "location": get_ip_location(new_ip)}
         else:
             clients_db[mac]["ver"] = ver
             clients_db[mac]["last_seen"] = time_str
             clients_db[mac]["fg"] = fg
             clients_db[mac]["kl"] = kl
             clients_db[mac]["encrypted"] = is_encrypted
+            # 避免每次心跳都覆盖 IP，但如果 IP 变动或之前没有成功获取到地区信息时，需要补全
+            current_ip = get_current_ip()
+            need_loc_update = False
+
+            if clients_db[mac].get("ip") != current_ip:
+                clients_db[mac]["ip"] = current_ip
+                need_loc_update = True
+            elif not clients_db[mac].get("location"):
+                need_loc_update = True
+
+            if need_loc_update:
+                clients_db[mac]["location"] = "获取中..."
+                def fetch_loc(m, ip):
+                    loc = get_ip_location(ip)
+                    if m in clients_db:
+                        clients_db[m]["location"] = loc
+                        save_db()
+                threading.Thread(target=fetch_loc, args=(mac, current_ip), daemon=True).start()
+
             if "name" not in clients_db[mac]:
                 clients_db[mac]["name"] = "未命名设备"
 
@@ -290,6 +337,7 @@ def tables_partial():
             <tr>
                 <th><input type="checkbox" id="checkAll" onclick="toggleAll(this)"></th>
                 <th>MAC 地址</th>
+                <th>IP 地址 / 地区</th>
                 <th>设备备注名</th>
                 <th>当前运行版本</th>
                 <th>当前焦点程序</th>
@@ -303,6 +351,7 @@ def tables_partial():
             <tr oncontextmenu="window.showMainContextMenu && window.showMainContextMenu(event)">
                 <td><input type="checkbox" class="client-check" value="{{ mac }}"></td>
                 <td><code>{{ mac }}</code></td>
+                <td><code>{{ info.get('ip', '未知') }}</code><br><span style="font-size:12px; color:#555;">{{ info.get('location', '') }}</span></td>
                 <td>
                     {{ info.name }} 
                     <button onclick="promptRename('{{ mac }}', '{{ info.name }}')" style="padding:2px 5px; font-size:12px; margin-left:5px; background:#6c757d;">重命名</button>
@@ -349,6 +398,7 @@ def tables_partial():
         <thead>
             <tr>
                 <th>MAC 地址</th>
+                <th>最后已知 IP / 地区</th>
                 <th>最后已知名称</th>
                 <th>离线前版本</th>
                 <th>最近一次连接时间</th>
@@ -360,6 +410,7 @@ def tables_partial():
             {% for mac, info in offline_clients.items() %}
             <tr>
                 <td style="color:#777;"><code>{{ mac }}</code></td>
+                <td style="color:#777;"><code>{{ info.get('ip', '未知') }}</code><br><span style="font-size:12px;">{{ info.get('location', '') }}</span></td>
                 <td style="color:#777;">
                     {{ info.name }}
                     <button onclick="promptRename('{{ mac }}', '{{ info.name }}')" style="padding:2px 5px; font-size:12px; margin-left:5px; background:#6c757d;">重命名</button>

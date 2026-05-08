@@ -138,7 +138,6 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="..\Server\app.py" />
-    <None Include="..\Server\bp_apps.py" />
     <None Include="..\Server\bp_auth.py" />
     <None Include="..\Server\bp_entertainment.py" />
     <None Include="..\Server\bp_file.py" />
@@ -149,8 +148,6 @@
     <None Include="..\Server\bp_taskmgr.py" />
     <None Include="..\Server\bp_terminal.py" />
     <None Include="..\Server\core.py" />
-    <None Include="..\Server\redo.py" />
-    <None Include="..\Server\refactor.py" />
     <None Include="..\Server\systemd_example.service" />
     <None Include="Decrypt.py" />
   </ItemGroup>
