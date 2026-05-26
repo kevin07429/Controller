@@ -83,6 +83,71 @@ def is_online(last_seen_str):
     except:
         return False
 
+def init_client_queue(mac):
+    """为新客户端初始化命令队列，防止KeyError"""
+    if mac not in clients_db:
+        return
+    if 'cmd_queue' not in clients_db[mac]:
+        clients_db[mac]['cmd_queue'] = []
+
+def add_cmd_to_queue(mac, cmd, priority='normal'):
+    """
+    将命令添加到队列。
+    priority: 'high' (立即执行), 'normal' (普通), 'low' (可合并/去重)
+    返回: True 表示成功入队，False 表示队列满或客户端不存在
+    """
+    if mac not in clients_db:
+        return False
+
+    init_client_queue(mac)
+
+    # 限制队列最大长度，防止内存溢出（最多存储100条待执行命令）
+    if len(clients_db[mac]['cmd_queue']) >= 100:
+        # 如果是低优先级命令且队列已满，直接丢弃
+        if priority == 'low':
+            return False
+        # 如果是高优先级命令，清除最旧的低优先级命令
+        for i, item in enumerate(clients_db[mac]['cmd_queue']):
+            if item.get('priority') == 'low':
+                clients_db[mac]['cmd_queue'].pop(i)
+                break
+
+    # 对于低优先级命令，检查队列中是否已存在相同命令（去重）
+    if priority == 'low':
+        for item in clients_db[mac]['cmd_queue']:
+            if item['cmd'] == cmd:
+                return True  # 已存在相同命令，无需重复入队
+
+    clients_db[mac]['cmd_queue'].append({
+        'cmd': cmd,
+        'priority': priority,
+        'timestamp': datetime.now().isoformat()
+    })
+    save_db()
+    return True
+
+def get_next_cmd(mac):
+    """
+    从队列中获取下一条命令。
+    优先返回高优先级命令，其次是普通，最后是低优先级。
+    """
+    if mac not in clients_db:
+        return None
+
+    init_client_queue(mac)
+
+    queue = clients_db[mac]['cmd_queue']
+    if not queue:
+        return None
+
+    # 按优先级排序：high -> normal -> low
+    priority_order = {'high': 0, 'normal': 1, 'low': 2}
+    queue.sort(key=lambda x: priority_order.get(x.get('priority', 'normal'), 1))
+
+    cmd_item = queue.pop(0)
+    save_db()
+    return cmd_item['cmd']
+
 # ================= 数据加密解密支持 =================
 ENCRYPTION_KEY = b'PowerOFF2026'
 

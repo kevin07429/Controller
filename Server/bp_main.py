@@ -2,7 +2,7 @@ from flask import Blueprint, request, render_template_string, session, redirect,
 from datetime import datetime
 import os, time, json, threading
 import urllib.parse
-from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, encrypt_data, decrypt_data
+from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, encrypt_data, decrypt_data, add_cmd_to_queue, get_next_cmd, init_client_queue
 
 bp = Blueprint('main', __name__)
 
@@ -100,7 +100,12 @@ def report_client():
                 # save_db()
                 return make_response(pending_file_cmd), 200
 
-            # 如果有缓存的待执行命令，通过心跳返回让客户端去执行
+            # 优先从命令队列获取（支持高优先级快速下发）
+            next_cmd = get_next_cmd(mac)
+            if next_cmd:
+                return make_response(next_cmd), 200
+
+            # 兼容旧逻辑：如果有缓存的待执行命令，通过心跳返回让客户端去执行
             pending_cmd = clients_db[mac].get('pending_cmd', '')
             if pending_cmd:
                 clients_db[mac]['pending_cmd'] = '' # 下发后清空，只下发一次

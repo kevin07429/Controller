@@ -1,5 +1,5 @@
 from flask import Blueprint, render_template_string, session, redirect, url_for, request, jsonify
-from core import clients_db, save_db, encrypt_data, decrypt_data
+from core import clients_db, save_db, encrypt_data, decrypt_data, add_cmd_to_queue, init_client_queue
 
 bp = Blueprint('entertainment', __name__)
 
@@ -69,6 +69,10 @@ def entertainment_page(mac):
             .btn-success:hover { background: #218838; }
             .btn-warning { background: #ffc107; color: #000; }
             .btn-warning:hover { background: #e0a800; }
+            .btn-info { background: #17a2b8; }
+            .btn-info:hover { background: #138496; }
+            .btn-info.active { background: #ff6b6b; animation: pulse 0.5s infinite; }
+            @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
             .header-link { margin-bottom: 20px; display: inline-block; text-decoration: none; color: #007bff; font-weight: bold; }
             .header-link:hover { text-decoration: underline; }
             .section { border-top: 1px solid #eee; padding-top: 20px; margin-top: 20px; }
@@ -102,6 +106,7 @@ def entertainment_page(mac):
                 </div>
                 <br>
                 <button class="btn btn-danger" onclick="sendVolumeCmd('mute')">🔇 切换系统静音</button>
+                <button class="btn btn-info" id="bounce-btn" onclick="toggleBounceMode()">🎉 蹦迪模式</button>
             </div>
 
             <div class="section">
@@ -128,12 +133,24 @@ def entertainment_page(mac):
             </div>
 
             <div id="status-msg" class="status-text">指令已下发！</div>
+            <div id="status-error" class="status-text" style="color: red; display: none;">指令投递失败，请稍后重试！</div>
 
             <script>
-                function showStatus() {
-                    const msg = document.getElementById('status-msg');
-                    msg.style.display = 'block';
-                    setTimeout(() => msg.style.display = 'none', 1500);
+                let bounceMode = false;
+                let bounceInterval = null;
+
+                function showStatus(message = '指令已下发！', isError = false) {
+                    if (isError) {
+                        const msg = document.getElementById('status-error');
+                        msg.innerText = message;
+                        msg.style.display = 'block';
+                        setTimeout(() => msg.style.display = 'none', 3000);
+                    } else {
+                        const msg = document.getElementById('status-msg');
+                        msg.innerText = message;
+                        msg.style.display = 'block';
+                        setTimeout(() => msg.style.display = 'none', 1500);
+                    }
                 }
 
                 function sendCmd(cmdStr) {
@@ -142,9 +159,16 @@ def entertainment_page(mac):
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({mac: '{{ mac }}', cmd: cmdStr})
                     }).then(res => res.json()).then(data => {
-                        showStatus();
+                        if (data.status === 'ok') {
+                            showStatus(data.msg || '指令已下发！', false);
+                        } else if (res.status === 429) {
+                            showStatus('服务器繁忙，请稍后再试！', true);
+                        } else {
+                            showStatus('投递失败: ' + (data.msg || '未知错误'), true);
+                        }
                     }).catch(err => {
                         console.error("发送失败: ", err);
+                        showStatus('网络错误，请检查连接！', true);
                     });
                 }
 
@@ -177,6 +201,35 @@ def entertainment_page(mac):
                     sendCmd("F_CMD:MEDIA:" + code);
                 }
 
+                function toggleBounceMode() {
+                    bounceMode = !bounceMode;
+                    const btn = document.getElementById('bounce-btn');
+
+                    if (bounceMode) {
+                        btn.classList.add('active');
+                        btn.innerText = '🎉 蹦迪模式（运行中...）';
+
+                        // Start bouncing effect - change volume every 5 seconds
+                        bounceInterval = setInterval(() => {
+                            const randomVol = Math.floor(Math.random() * 101); // 0-100
+                            setVolume(randomVol);
+                            document.getElementById('vol-slider').value = randomVol;
+                            document.getElementById('vol-display').innerText = randomVol;
+                        }, 5000);
+
+                        // Send first random volume immediately
+                        const initialVol = Math.floor(Math.random() * 101);
+                        setVolume(initialVol);
+                        document.getElementById('vol-slider').value = initialVol;
+                        document.getElementById('vol-display').innerText = initialVol;
+                    } else {
+                        btn.classList.remove('active');
+                        btn.innerText = '🎉 蹦迪模式';
+                        clearInterval(bounceInterval);
+                        bounceInterval = null;
+                    }
+                }
+
                 // Periodic UI refresh & Trigger Agent Info command
                 function pollInfo() {
                     // Tell agent to report media info
@@ -193,8 +246,8 @@ def entertainment_page(mac):
                         .then(d => {
                             if(d.status === 'ok') {
                                 document.getElementById('song-title').innerText = d.song;
-                                // Only update slider if user isn't currently dragging it
-                                if (document.activeElement !== document.getElementById('vol-slider')) {
+                                // Only update slider if user isn't currently dragging it and not in bounce mode
+                                if (document.activeElement !== document.getElementById('vol-slider') && !bounceMode) {
                                     document.getElementById('vol-slider').value = d.vol;
                                     document.getElementById('vol-display').innerText = d.vol;
                                 }
