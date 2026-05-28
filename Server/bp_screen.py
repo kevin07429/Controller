@@ -25,7 +25,6 @@ def api_stream_start(mac):
         return jsonify({"status": "ok"})
     return jsonify({"status": "error"})
 
-
 @bp.route('/screen/<mac>')
 def screen_page(mac):
     if not session.get('logged_in'): return redirect(url_for('auth.login'))

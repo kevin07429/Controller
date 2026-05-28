@@ -679,13 +679,14 @@ bool ApplyUpdate(const std::filesystem::path& currentExePath, const std::filesys
         Log("ReplaceFileW failed: " + GetLastErrorText());
         Log("Falling back to MoveFileEx replacement");
 
-        if (!MoveFileReplace(currentExePath, backupPath)) {
+        if (!CopyFileW(currentExePath.c_str(), std::filesystem::path(backupPath).c_str(), FALSE)) {
+            Log("Backup copy failed before fallback replacement: " + GetLastErrorText());
             return false;
         }
 
         if (!MoveFileReplace(newExePath, currentExePath)) {
-            Log("New exe move failed, attempting rollback");
-            if (!MoveFileReplace(backupPath, currentExePath)) {
+            Log("New exe replace failed, attempting rollback from backup copy");
+            if (!CopyFileW(std::filesystem::path(backupPath).c_str(), currentExePath.c_str(), FALSE)) {
                 Log("Rollback failed; manual repair may be required");
             }
             return false;

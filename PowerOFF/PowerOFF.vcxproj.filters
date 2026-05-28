@@ -62,5 +62,11 @@
     <None Include="..\Server\ui.py">
       <Filter>源文件</Filter>
     </None>
+    <None Include="..\Server\bp_camera.py">
+      <Filter>源文件</Filter>
+    </None>
+    <None Include="PromptVersion.ps1">
+      <Filter>源文件</Filter>
+    </None>
   </ItemGroup>
 </Project>

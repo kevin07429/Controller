@@ -7,6 +7,15 @@ except Exception:
 
 bp = Blueprint('entertainment', __name__)
 
+def _replace_pending_media_bounce(mac, cmd):
+    init_client_queue(mac)
+    queue = clients_db[mac].get('cmd_queue', [])
+    clients_db[mac]['cmd_queue'] = [
+        item for item in queue
+        if not str(item.get('cmd', '')).startswith('F_CMD:MEDIA_BOUNCE:')
+    ]
+    return add_cmd_to_queue(mac, cmd, priority='low')
+
 @bp.route('/api/media_info_result', methods=['POST'])
 def media_info_result():
     mac_raw = request.form.get('mac')
@@ -41,8 +50,23 @@ def get_entertainment_info(mac):
     return jsonify({
         "status": "ok",
         "vol": clients_db[mac].get('media_vol', 50),
-        "song": clients_db[mac].get('media_song', '等待同步中...')
+        "song": clients_db[mac].get('media_song', '等待同步中...'),
+        "bounce": clients_db[mac].get('media_bounce_enabled', False)
     })
+
+@bp.route('/api/media_bounce/<mac>', methods=['POST'])
+def set_media_bounce(mac):
+    if not session.get('logged_in'):
+        return jsonify({"status": "error", "msg": "No auth"}), 403
+    if mac not in clients_db:
+        return jsonify({"status": "error", "msg": "Device not found"}), 404
+
+    data = request.json or {}
+    enabled = bool(data.get('enabled', False))
+    clients_db[mac]['media_bounce_enabled'] = enabled
+    _replace_pending_media_bounce(mac, f"F_CMD:MEDIA_BOUNCE:{1 if enabled else 0}")
+    save_db()
+    return jsonify({"status": "ok", "enabled": enabled})
 
 @bp.route('/entertainment/<mac>')
 def entertainment_page(mac):
@@ -138,7 +162,6 @@ def entertainment_page(mac):
 
             <script>
                 let bounceMode = false;
-                let bounceInterval = null;
                 let monitorBounceMode = false;
                 let monitorBounceInterval = null;
 
@@ -205,32 +228,34 @@ def entertainment_page(mac):
                 }
 
                 function toggleBounceMode() {
-                    bounceMode = !bounceMode;
+                    setBounceMode(!bounceMode);
+                }
+
+                function setBounceButton(enabled) {
                     const btn = document.getElementById('bounce-btn');
-
-                    if (bounceMode) {
+                    bounceMode = enabled;
+                    if (enabled) {
                         btn.classList.add('active');
-                        btn.innerText = '🎉 蹦迪模式（运行中...）';
-
-                        // Start bouncing effect - change volume every 5 seconds
-                        bounceInterval = setInterval(() => {
-                            const randomVol = Math.floor(Math.random() * 101); // 0-100
-                            setVolume(randomVol);
-                            document.getElementById('vol-slider').value = randomVol;
-                            document.getElementById('vol-display').innerText = randomVol;
-                        }, 5000);
-
-                        // Send first random volume immediately
-                        const initialVol = Math.floor(Math.random() * 101);
-                        setVolume(initialVol);
-                        document.getElementById('vol-slider').value = initialVol;
-                        document.getElementById('vol-display').innerText = initialVol;
+                        btn.innerText = 'Volume bounce (running)';
                     } else {
                         btn.classList.remove('active');
-                        btn.innerText = '🎉 蹦迪模式';
-                        clearInterval(bounceInterval);
-                        bounceInterval = null;
+                        btn.innerText = 'Volume bounce';
                     }
+                }
+
+                function setBounceMode(enabled) {
+                    fetch('/api/media_bounce/{{ mac }}', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({enabled})
+                    }).then(r => r.json()).then(data => {
+                        if (data.status === 'ok') {
+                            setBounceButton(data.enabled);
+                            showStatus(data.enabled ? 'Volume bounce enabled.' : 'Volume bounce disabled.');
+                        } else {
+                            showStatus('Failed to update bounce state.', true);
+                        }
+                    }).catch(() => showStatus('Network error.', true));
                 }
 
                 function toggleMonitorBounceMode() {
@@ -281,6 +306,7 @@ def entertainment_page(mac):
                         .then(d => {
                             if(d.status === 'ok') {
                                 document.getElementById('song-title').innerText = d.song;
+                                setBounceButton(!!d.bounce);
                                 // Only update slider if user isn't currently dragging it and not in bounce mode
                                 if (document.activeElement !== document.getElementById('vol-slider') && !bounceMode) {
                                     document.getElementById('vol-slider').value = d.vol;

