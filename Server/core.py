@@ -5,6 +5,7 @@ import os
 import json
 import time
 import threading
+import shutil
 
 
 # 自动清理后台任务：删除超过24小时的缓存文件释放服务器空间
@@ -44,20 +45,53 @@ def log_login_attempt(req, success):
 
 UPDATE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(UPDATE_DIR, 'clients.json')
+DB_BACKUP_FILE = os.path.join(UPDATE_DIR, 'clients.json.bak')
+DB_UPDATE_BACKUP_FILE = os.path.join(UPDATE_DIR, 'clients.before_server_update.json')
 
 VERSION_FILE = os.path.join(UPDATE_DIR, 'version.txt')
 if not os.path.exists(VERSION_FILE):
     with open(VERSION_FILE, 'w', encoding='utf-8') as f:
         f.write("1.2.4")
 
-if os.path.exists(DB_FILE):
-    with open(DB_FILE, 'r', encoding='utf-8') as f:
+def _load_json_file(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+def _load_clients_db():
+    candidates = []
+    for path in [DB_FILE, DB_BACKUP_FILE, DB_UPDATE_BACKUP_FILE]:
+        if not os.path.exists(path) or os.path.getsize(path) <= 2:
+            continue
         try:
-            clients_db = json.load(f)
-        except:
-            clients_db = {}
-else:
-    clients_db = {}
+            data = _load_json_file(path)
+            candidates.append((len(data), path, data))
+        except Exception as e:
+            print(f"Load clients DB failed from {path}: {e}")
+
+    if not candidates:
+        return {}
+
+    candidates.sort(key=lambda item: (item[0], os.path.getmtime(item[1])), reverse=True)
+    _, best_path, best_data = candidates[0]
+    if best_path != DB_FILE:
+        try:
+            shutil.copy2(best_path, DB_FILE)
+            print(f"Recovered clients DB from {best_path}")
+        except Exception as e:
+            print(f"Recover clients DB failed: {e}")
+    return best_data
+
+clients_db = _load_clients_db()
+
+def backup_clients_db(reason='manual'):
+    try:
+        if os.path.exists(DB_FILE) and os.path.getsize(DB_FILE) > 2:
+            shutil.copy2(DB_FILE, DB_BACKUP_FILE)
+            if reason == 'server_update':
+                shutil.copy2(DB_FILE, DB_UPDATE_BACKUP_FILE)
+    except Exception as e:
+        print(f"Backup DB Error: {e}")
 
 def save_db():
     try:
@@ -71,8 +105,19 @@ def save_db():
                     if isinstance(v, (str, int, float, bool, type(None), list, dict)):
                         safe_info[k] = v
             db_copy[mac] = safe_info
-        with open(DB_FILE, 'w', encoding='utf-8') as f:
+
+        # Do not let a transient empty in-memory DB wipe an existing device database.
+        if not db_copy and os.path.exists(DB_FILE) and os.path.getsize(DB_FILE) > 2:
+            print("Save DB skipped: refusing to overwrite existing clients.json with an empty DB")
+            return
+
+        backup_clients_db()
+        tmp_file = DB_FILE + '.tmp'
+        with open(tmp_file, 'w', encoding='utf-8') as f:
             json.dump(db_copy, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, DB_FILE)
     except Exception as e:
         print(f"Save DB Error: {e}")
 

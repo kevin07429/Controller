@@ -2,6 +2,10 @@ from flask import Blueprint, request, render_template_string, session, redirect,
 from datetime import datetime
 import os, time, json, threading
 from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, decrypt_data
+try:
+    from ui import ADMIN_CSS
+except Exception:
+    ADMIN_CSS = ""
 
 from werkzeug.utils import secure_filename
 bp = Blueprint('file', __name__)
@@ -13,51 +17,46 @@ def files_page(mac):
 
     FILES_HTML = r"""
     <!DOCTYPE html>
-    <html lang="zh-CN">
+    <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
         <title>文件管理 - {{ info.name }} ({{ mac }})</title>
         <style>
-            body { background: #f0f2f5; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; padding: 10px; margin: 0; }
-            .header { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-bottom: 10px; display: flex; flex-direction: column; }
-            .header a { margin-top: 10px; color: #007bff; text-decoration: none; }
-            .header a:hover { text-decoration: underline; }
-            .btn { background: #007bff; color: white; border: none; padding: 5px 10px; border-radius: 3px; cursor: pointer; margin: 2px; }
-            .btn:hover { background: #0056b3; }
-            .path-bar { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 10px; align-items: center; }
-            .path-bar input { flex-grow: 1; padding: 5px; min-width: 150px; }
-            .table-responsive { overflow-x: auto; }
-            table { width: 100%; min-width: 600px; border-collapse: collapse; background: white; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); user-select: none; }
-            th, td { padding: 10px; border-bottom: 1px solid #ddd; text-align: left; }
-            th { background: #f8f9fa; }
-            tr:hover { background: #e2e6ea; cursor: pointer;}
-            .icon { width: 20px; text-align: center; display: inline-block; }
-            #loading { color: red; font-weight: bold; display: none; }
-            /* Context Menu Styles */
-            #context-menu { display: none; position: absolute; z-index: 1000; background-color: white; border: 1px solid #ccc; box-shadow: 2px 2px 5px rgba(0,0,0,0.2); border-radius: 4px; padding: 5px 0; min-width: 150px; }
-            .context-item { padding: 8px 15px; cursor: pointer; font-size: 14px; }
-            .context-item:hover { background-color: #007bff; color: white; }
+            {{ admin_css|safe }}
+            body { background: var(--bg); padding: 0; }
+            .file-toolbar, .path-bar { background:#fff; border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:12px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+            .path-bar input { flex:1 1 360px; min-width:180px; }
+            .table-responsive { overflow-x:auto; border:1px solid var(--line); border-radius:8px; background:#fff; }
+            table { min-width:720px; margin:0; user-select:none; }
+            tr:hover { background:#f8fafc; cursor:pointer; }
+            .icon { width:28px; text-align:center; display:inline-block; }
+            #loading { color:var(--amber); font-weight:700; display:none; }
+            #context-menu { display:none; position:absolute; z-index:1000; background:#fff; border:1px solid var(--line); box-shadow:0 12px 28px rgba(15,23,42,.16); border-radius:8px; padding:6px; min-width:190px; }
+            .context-item { padding:9px 10px; cursor:pointer; font-size:14px; border-radius:6px; }
+            .context-item:hover { background:#eff6ff; color:#1d4ed8; }
+            .debug-panel { margin-top:14px; background:#111827; color:#86efac; padding:12px; height:160px; overflow-y:auto; font-family:Consolas,monospace; border-radius:8px; border:1px solid #263244; }
+            @media(max-width:640px){ .file-toolbar button,.path-bar button{flex:1 1 calc(50% - 8px)} table{min-width:680px} }
         </style>
     </head>
     <body onclick="hideContextMenu()">
+        <main class="shell">
         <div class="header">
-            <span>📁 {{ info.name }} [{{ mac }}] - 远程文件管理 <span id="conn_status"></span></span>
-            <a href="/">[ 返回设备列表 ]</a>
+            <div><h2>File Manager</h2><div class="subtle">{{ info.name }} [{{ mac }}] <span id="conn_status"></span></div></div>
+            <a class="btn muted" href="/">Back</a>
         </div>
         <div class="path-bar">
-            <span>当前路径:</span>
+            <span class="subtle">Path</span>
             <input type="text" id="current_path" value="此电脑" onkeydown="if(event.key==='Enter') loadPath()">
-            <button class="btn" onclick="loadPath()">前往</button>
-            <button class="btn" onclick="loadPath(true)" style="background:#28a745;">刷新</button>
-            <span id="loading">执行中...请稍候</span>
+            <button class="btn" onclick="loadPath()">Open</button>
+            <button class="btn ok" onclick="loadPath(true)">Refresh</button>
+            <span id="loading">Working...</span>
         </div>
 
-        <div style="margin-bottom: 10px;">
+        <div class="file-toolbar">
             <input type="file" id="uploadFile" style="display:inline-block; border:1px solid #ccc; padding:3px; max-width: 100%;">
-            <br><br>
-            <button class="btn" onclick="uploadToServer()">上传到当前目录</button>
-            <button class="btn" onclick="cmdMkdir()" style="background:#17a2b8;">新建文件夹</button>
+            <button class="btn" onclick="uploadToServer()">Upload here</button>
+            <button class="btn muted" onclick="cmdMkdir()">New folder</button>
         </div>
 
         <div class="table-responsive">
@@ -66,38 +65,39 @@ def files_page(mac):
                 <tr>
                     <th style="width:30px;"><input type="checkbox" onclick="toggleAllFiles(this)"></th>
                     <th style="width:30px;"></th>
-                    <th onclick="sortFiles('Name')" style="cursor:pointer; user-select:none;">名称 <span id="sort_Name"></span></th>
-                    <th onclick="sortFiles('Length')" style="cursor:pointer; user-select:none; width:120px;">大小 <span id="sort_Length"></span></th>
-                    <th onclick="sortFiles('LastWriteTime')" style="cursor:pointer; user-select:none; width:200px;">修改时间 <span id="sort_LastWriteTime"></span></th>
+                    <th onclick="sortFiles('Name')" style="cursor:pointer; user-select:none;">Name <span id="sort_Name"></span></th>
+                    <th onclick="sortFiles('Length')" style="cursor:pointer; user-select:none; width:120px;">Size <span id="sort_Length"></span></th>
+                    <th onclick="sortFiles('LastWriteTime')" style="cursor:pointer; user-select:none; width:200px;">Modified <span id="sort_LastWriteTime"></span></th>
                 </tr>
             </thead>
             <tbody id="file_list">
-                <tr><td colspan="5" style="text-align:center;color:#888;">请点击“前往”以加载目录...</td></tr>
+                <tr><td colspan="5" style="text-align:center;color:#888;">Open a path to load files.</td></tr>
             </tbody>
         </table>
         </div>
 
         <!-- Context Menu Template -->
         <div id="context-menu">
-            <div class="context-item single-only" id="m_open" onclick="onContextOpen()">打开 / 进入</div>
-            <div class="context-item single-only" id="m_down" onclick="onContextDown()">📥 下载到控制端</div>
-            <div class="context-item single-only" id="m_exec" onclick="onContextExec()">⚡ 在此电脑静默运行</div>
-            <div class="context-item single-only" id="m_rn" onclick="onContextRn()">📝 重命名</div>
+            <div class="context-item single-only" id="m_open" onclick="onContextOpen()">Open / Enter</div>
+            <div class="context-item single-only" id="m_down" onclick="onContextDown()">Download to server</div>
+            <div class="context-item single-only" id="m_exec" onclick="onContextExec()">Run on client</div>
+            <div class="context-item single-only" id="m_rn" onclick="onContextRn()">Rename</div>
 
-            <div class="context-item multi-only" id="m_down_multi" onclick="onContextDownMulti()" style="display:none;">📥 批量后台下载</div>
-            <div class="context-item multi-only" id="m_del_multi" onclick="onContextDelMulti()" style="display:none; color:red;">🗑️ 批量强制删除</div>
+            <div class="context-item multi-only" id="m_down_multi" onclick="onContextDownMulti()" style="display:none;">Batch download</div>
+            <div class="context-item multi-only" id="m_del_multi" onclick="onContextDelMulti()" style="display:none; color:red;">Batch delete</div>
 
             <div style="border-top:1px solid #ddd; margin:4px 0;" class="single-only"></div>
-            <div class="context-item single-only" style="color:red;" id="m_del" onclick="onContextDel()">🗑️ 强制删除</div>
+            <div class="context-item single-only" style="color:red;" id="m_del" onclick="onContextDel()">Delete</div>
         </div>
 
-        <div style="margin-top: 20px; background: #222; color: #0f0; padding: 10px; height: 150px; overflow-y: scroll; font-family: Consolas;">
+        <div class="debug-panel">
             <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
-                <b>[终端通信调试日志]</b>
-                <button onclick="document.getElementById('debug_log').innerText=''" style="background:#444;color:#fff;border:none;padding:2px 5px;cursor:pointer;">清空</button>
+                <b>Transfer Log</b>
+                <button class="mini" onclick="document.getElementById('debug_log').innerText=''">Clear</button>
             </div>
             <pre id="debug_log" style="white-space: pre-wrap; word-wrap: break-word; margin: 0;"></pre>
         </div>
+        </main>
 
         <script>
             function checkPing() {
@@ -503,7 +503,7 @@ def files_page(mac):
     </body>
     </html>
     """
-    return render_template_string(FILES_HTML, mac=mac, info=clients_db[mac])
+    return render_template_string(FILES_HTML, admin_css=ADMIN_CSS, mac=mac, info=clients_db[mac])
 
 @bp.route('/api/file/client_upload/<mac>', methods=['POST'])
 def client_upload(mac):

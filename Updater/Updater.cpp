@@ -22,10 +22,12 @@ namespace {
 constexpr const char* kServiceName = "WlanMonitorSvc";
 constexpr const char* kUpdateExitEventName = "Global\\WlanMonitorSvc_UpdateExit_Event";
 constexpr const char* kAllowServiceStopEventName = "Global\\WlanMonitorSvc_AllowServiceStop_Event";
-constexpr DWORD kStopTimeoutMs = 30000;
+constexpr DWORD kStopTimeoutMs = 5000;
 constexpr DWORD kReplaceTimeoutMs = 60000;
-constexpr DWORD kCooperativeExitTimeoutMs = 30000;
-constexpr DWORD kPollIntervalMs = 500;
+constexpr DWORD kCooperativeExitTimeoutMs = 3000;
+constexpr DWORD kPostStopExitTimeoutMs = 1000;
+constexpr DWORD kMessageExitTimeoutMs = 1000;
+constexpr DWORD kPollIntervalMs = 250;
 
 std::filesystem::path g_logPath;
 
@@ -39,7 +41,7 @@ std::string NowString() {
     return buf;
 }
 
-// 加密实现：使用 XOR 和 Hex 编码（与 PowerOFF.cpp 保持一致）
+// XOR + hex encoding, matching PowerOFF.cpp log format.
 std::string EncryptString(const std::string& data) {
     const std::string key = "PowerOFF2026";
     std::string encrypted;
@@ -49,7 +51,7 @@ std::string EncryptString(const std::string& data) {
         unsigned char keyChar = key[i % key.length()];
         unsigned char xorByte = byte ^ keyChar;
 
-        // 转换为 Hex 字符串
+        // Convert to a hex string.
         char hexBuf[3];
         sprintf_s(hexBuf, sizeof(hexBuf), "%02X", xorByte);
         encrypted += hexBuf;
@@ -401,11 +403,11 @@ bool TerminateServiceProcessIfRunning(SC_HANDLE service) {
 }
 
 bool StopServiceIfPresent() {
-    // 检查是否被允许停止服务（仅在更新时允许）
+    // Only stop the service when updater has explicitly entered update mode.
     HANDLE hAllowStopEvent = OpenEventA(SYNCHRONIZE, FALSE, kAllowServiceStopEventName);
     if (!hAllowStopEvent) {
         Log("Service stop is not allowed (not in update mode); skipping service stop");
-        return true;  // 返回 true 表示"操作完成"（虽然没有停止）
+        return true;
     }
     CloseHandle(hAllowStopEvent);
 
@@ -593,21 +595,53 @@ std::filesystem::path StageNewExe(const std::filesystem::path& newExePath) {
     return stagedPath;
 }
 
-HANDLE SignalUpdateExitEvent() {
-    HANDLE hEvent = CreateEventA(nullptr, TRUE, FALSE, kUpdateExitEventName);
+HANDLE SignalNamedEvent(const char* eventName, const char* description) {
+    HANDLE hEvent = CreateEventA(nullptr, TRUE, FALSE, eventName);
     if (!hEvent) {
-        Log("Create update exit event failed: " + GetLastErrorText());
+        Log(std::string("Create ") + description + " event failed: " + GetLastErrorText());
         return nullptr;
     }
 
     if (!SetEvent(hEvent)) {
-        Log("Set update exit event failed: " + GetLastErrorText());
+        Log(std::string("Set ") + description + " event failed: " + GetLastErrorText());
         CloseHandle(hEvent);
         return nullptr;
     }
 
-    Log("Update exit event signaled");
+    Log(std::string(description) + " event signaled");
     return hEvent;
+}
+
+HANDLE SignalUpdateExitEvent() {
+    return SignalNamedEvent(kUpdateExitEventName, "update exit");
+}
+
+HANDLE SignalAllowServiceStopEvent() {
+    return SignalNamedEvent(kAllowServiceStopEventName, "allow service stop");
+}
+
+std::filesystem::path UpdateExitFlagPath(const std::filesystem::path& currentExePath) {
+    return std::filesystem::path(currentExePath.string() + ".update_exit");
+}
+
+bool CreateUpdateExitFlag(const std::filesystem::path& currentExePath) {
+    auto flagPath = UpdateExitFlagPath(currentExePath);
+    std::ofstream flag(flagPath, std::ios::trunc);
+    if (!flag.is_open()) {
+        Log("Failed to create update exit flag [" + PathToUtf8(flagPath) + "]");
+        return false;
+    }
+
+    flag << GetCurrentProcessId() << "\r\n";
+    Log("Update exit flag created: " + PathToUtf8(flagPath));
+    return true;
+}
+
+void DeleteUpdateExitFlag(const std::filesystem::path& currentExePath) {
+    auto flagPath = UpdateExitFlagPath(currentExePath);
+    if (DeleteFileW(flagPath.c_str())) {
+        Log("Update exit flag deleted: " + PathToUtf8(flagPath));
+    }
 }
 
 bool ApplyUpdate(const std::filesystem::path& currentExePath, const std::filesystem::path& newExePath) {
@@ -708,6 +742,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         return 1;
     }
 
+    CreateUpdateExitFlag(currentExePath);
+    HANDLE hAllowStopEvent = SignalAllowServiceStopEvent();
     HANDLE hUpdateExitEvent = SignalUpdateExitEvent();
 
     if (WaitForProcessesToExit(currentExePath, kCooperativeExitTimeoutMs)) {
@@ -717,21 +753,21 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         StopServiceIfPresent();
     }
 
-    if (!WaitForProcessesToExit(currentExePath, 5000)) {
+    if (!WaitForProcessesToExit(currentExePath, kPostStopExitTimeoutMs)) {
         Log("Process still running after service stop request; posting quit/close messages");
         RequestProcessesToExitByMessages(currentExePath);
-        WaitForProcessesToExit(currentExePath, 10000);
+        WaitForProcessesToExit(currentExePath, kMessageExitTimeoutMs);
     }
 
     if (!WaitForProcessesToExit(currentExePath, 1000)) {
-        Log("Process still running after window/thread messages; requesting shutdown through Restart Manager");
-        RequestProcessesToCloseWithRestartManager(currentExePath);
-        WaitForProcessesToExit(currentExePath, 15000);
-    }
-
-    if (!WaitForProcessesToExit(currentExePath, 1000)) {
-        Log("Process still running after Restart Manager request; terminating exact-path leftovers to complete update");
+        Log("Process still running after cooperative shutdown attempts; terminating exact-path leftovers to complete update");
         TerminateProcessesByImagePath(currentExePath);
+    }
+
+    if (!WaitForProcessesToExit(currentExePath, 1000)) {
+        Log("Process still running after termination attempt; trying Restart Manager as last resort");
+        RequestProcessesToCloseWithRestartManager(currentExePath);
+        WaitForProcessesToExit(currentExePath, 3000);
     }
 
     if (!WaitForProcessesToExit(currentExePath, 1000)) {
@@ -751,12 +787,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         hUpdateExitEvent = nullptr;
     }
 
-    // 清除允许停止服务的事件（更新完成）
-    HANDLE hAllowStopEvent = OpenEventA(SYNCHRONIZE, FALSE, kAllowServiceStopEventName);
     if (hAllowStopEvent) {
         ResetEvent(hAllowStopEvent);
         CloseHandle(hAllowStopEvent);
+        hAllowStopEvent = nullptr;
     }
+
+    DeleteUpdateExitFlag(currentExePath);
 
     StartServiceIfPresent(currentExePath);
 

@@ -2,6 +2,10 @@ from flask import Blueprint, request, render_template_string, session, redirect,
 from datetime import datetime
 import os, time, json, threading
 from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, decrypt_data
+try:
+    from ui import ADMIN_CSS
+except Exception:
+    ADMIN_CSS = ""
 
 bp = Blueprint('screen', __name__)
 
@@ -21,122 +25,20 @@ def api_stream_start(mac):
         return jsonify({"status": "ok"})
     return jsonify({"status": "error"})
 
+
 @bp.route('/screen/<mac>')
 def screen_page(mac):
     if not session.get('logged_in'): return redirect(url_for('auth.login'))
-    if mac not in clients_db: return "设备不存在"
-
+    if mac not in clients_db: return "Device not found"
     SCREEN_HTML = """
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>屏幕监控 - {{ info.name }} ({{ mac }})</title>
-        <style>
-            body { background: #f0f2f5; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; padding: 10px; margin: 0; text-align: center; }
-            .header { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-bottom: 10px; display: flex; flex-direction: column; text-align: left; }
-            .header a { color: #007bff; text-decoration: none; margin-top: 5px; }
-            .btn { background: #007bff; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-size: 16px; margin: 5px; max-width: 100%; }
-            .btn:hover { background: #0056b3; }
-            .btn:disabled { background: #ccc; cursor: not-allowed; }
-            .btn-danger { background: #dc3545; }
-            .btn-danger:hover { background: #c82333; }
-            img { width: 100%; height: auto; max-width: 100%; border: 1px solid #ccc; box-shadow: 0 4px 8px rgba(0,0,0,0.1); margin-top: 10px; background: #000; object-fit: contain; }
-        </style>
-    </head>
-    <body onunload="stopStream()">
-        <div class="header">
-            <span>📺 屏幕监控 - {{ info.name }} [{{ mac }}] (支持30FPS流畅串流)</span>
-            <a href="/">[ 返回设备列表 ]</a>
-        </div>
-        <div>
-            显示分标率阈值:
-            <select id="resSelect">
-                <option value="600">600p (很流畅)</option>
-                <option value="800">800p (建议)</option>
-                <option value="1280" selected>1280p (默认折中)</option>
-                <option value="1920">1080p (卡顿原画)</option>
-            </select>
-            画质:
-            <select id="qualitySelect">
-                <option value="10">10% (极速狗牙)</option>
-                <option value="20">20% (极速轻度模糊)</option>
-                <option value="30" selected>30% (默认)</option>
-                <option value="60">60% (高清)</option>
-                <option value="100">100% (原图幻灯片)</option>
-            </select>
-            <button id="startBtn" class="btn" onclick="startStream()">▶️ 开始流畅串流</button>
-            <button id="stopBtn" class="btn btn-danger" onclick="stopStream()" disabled>⏹️ 停止串流</button>
-            <br>
-            <span id="statusText" style="color: #666; font-size: 14px;">点击“开始流畅串流”获取连续自适应视频流...</span>
-            <span id="fpsText" style="color: #d00; font-weight: bold; margin-left: 15px; font-size: 16px;"></span>
-        </div>
-        <img id="streamImg" src="" alt="等待串流..." style="display: none;">
-
-        <script>
-            let fpsInterval = null;
-            let currentStreamSrc = '';
-
-            function startStream() {
-                var btnStart = document.getElementById('startBtn');
-                var btnStop = document.getElementById('stopBtn');
-                var st = document.getElementById('statusText');
-                var res = document.getElementById('resSelect').value;
-                var qual = document.getElementById('qualitySelect').value;
-
-                btnStart.disabled = true;
-                btnStop.disabled = false;
-                st.innerText = "⏳ 正在通知受控端拉起流媒体进进程... 请稍候...";
-
-                fetch('/api/stream/start/{{ mac }}?res=' + res + '&q=' + qual, { method: 'POST' })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.status === 'ok') {
-                        st.innerText = "✅ 信令已下发，正在接收端缓冲...";
-                        var img = document.getElementById('streamImg');
-                        img.style.display = 'inline-block';
-                        setTimeout(() => {
-                            img.src = '/stream_video/{{ mac }}?t=' + Date.now();
-                            st.innerText = "📺 串流进行中";
-                            fpsInterval = setInterval(pollFps, 1000);
-                        }, 1000);
-                    } else {
-                        st.innerText = "❌ 信令发送失败!";
-                        btnStart.disabled = false;
-                        btnStop.disabled = true;
-                    }
-                }).catch(e => {
-                    st.innerText = "❌ 网络错误: " + e;
-                    btnStart.disabled = false;
-                    btnStop.disabled = true;
-                });
-            }
-
-            function stopStream() {
-                document.getElementById('startBtn').disabled = false;
-                document.getElementById('stopBtn').disabled = true;
-                document.getElementById('statusText').innerText = "⏹️ 串流已停止";
-                document.getElementById('streamImg').style.display = 'none';
-                document.getElementById('streamImg').src = "";
-                document.getElementById('fpsText').innerText = "";
-                if(fpsInterval) clearInterval(fpsInterval);
-
-                fetch('/api/stream/stop/{{ mac }}', { method: 'POST', keepalive: true });
-            }
-
-            function pollFps() {
-                fetch('/api/stream/fps/{{ mac }}')
-                .then(r => r.json())
-                .then(data => {
-                    document.getElementById('fpsText').innerText = "FPS: " + data.fps;
-                });
-            }
-        </script>
-    </body>
-    </html>
+    <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"><title>Screen - {{ info.name }} ({{ mac }})</title>
+    <style>{{ admin_css|safe }}body{text-align:center}.screen-wrap{max-width:1180px;margin:0 auto;padding:18px}.stream-card{background:#fff;border:1px solid var(--line);border-radius:8px;padding:14px}.stream-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:center;margin:12px 0}.stream-controls select{width:auto;min-width:120px}#streamImg{width:100%;height:auto;max-width:100%;border:1px solid var(--line);border-radius:8px;box-shadow:0 4px 12px rgba(15,23,42,.12);margin-top:10px;background:#000;object-fit:contain}@media(max-width:640px){.stream-controls select,.stream-controls button{width:100%}}</style></head>
+    <body onunload="stopStream()"><main class="screen-wrap"><div class="header"><div><b>Screen Stream</b><br><span class="subtle">{{ info.name }} [{{ mac }}]</span></div><a class="btn muted" href="/">Back</a></div><section class="stream-card"><div class="stream-controls"><label>Resolution <select id="resSelect"><option value="600">600p fast</option><option value="800">800p recommended</option><option value="1280" selected>1280p balanced</option><option value="1920">1080p source</option></select></label><label>Quality <select id="qualitySelect"><option value="10">10% fastest</option><option value="20">20% light</option><option value="30" selected>30% default</option><option value="60">60% high</option><option value="100">100% source</option></select></label><button id="startBtn" class="btn" onclick="startStream()">Start Stream</button><button id="stopBtn" class="btn danger" onclick="stopStream()" disabled>Stop Stream</button></div><div><span id="statusText" class="subtle">Click Start Stream to request continuous screen frames.</span><span id="fpsText" style="color:#dc2626;font-weight:700;margin-left:12px"></span></div><img id="streamImg" src="" alt="Waiting for stream" style="display:none"></section></main>
+    <script>
+    let fpsInterval=null;function startStream(){var bs=document.getElementById('startBtn'),bp=document.getElementById('stopBtn'),st=document.getElementById('statusText'),res=document.getElementById('resSelect').value,qual=document.getElementById('qualitySelect').value;bs.disabled=true;bp.disabled=false;st.innerText='Requesting stream process...';fetch('/api/stream/start/{{ mac }}?res='+res+'&q='+qual,{method:'POST'}).then(r=>r.json()).then(data=>{if(data.status==='ok'){st.innerText='Command sent. Waiting for frames...';var img=document.getElementById('streamImg');img.style.display='inline-block';setTimeout(()=>{img.src='/stream_video/{{ mac }}?t='+Date.now();st.innerText='Streaming';fpsInterval=setInterval(pollFps,1000)},1000)}else{st.innerText='Command failed';bs.disabled=false;bp.disabled=true}}).catch(e=>{st.innerText='Network error: '+e;bs.disabled=false;bp.disabled=true})}function stopStream(){document.getElementById('startBtn').disabled=false;document.getElementById('stopBtn').disabled=true;document.getElementById('statusText').innerText='Stream stopped';document.getElementById('streamImg').style.display='none';document.getElementById('streamImg').src='';document.getElementById('fpsText').innerText='';if(fpsInterval)clearInterval(fpsInterval);fetch('/api/stream/stop/{{ mac }}',{method:'POST',keepalive:true})}function pollFps(){fetch('/api/stream/fps/{{ mac }}').then(r=>r.json()).then(data=>{document.getElementById('fpsText').innerText='FPS: '+data.fps})}
+    </script></body></html>
     """
-    return render_template_string(SCREEN_HTML, mac=mac, info=clients_db[mac])
+    return render_template_string(SCREEN_HTML, admin_css=ADMIN_CSS, mac=mac, info=clients_db[mac])
 
 @bp.route('/api/stream/stop/<mac>', methods=['POST'])
 def api_stream_stop(mac):

@@ -59,5 +59,8 @@
     <None Include="..\Server\bp_entertainment.py">
       <Filter>源文件</Filter>
     </None>
+    <None Include="..\Server\ui.py">
+      <Filter>源文件</Filter>
+    </None>
   </ItemGroup>
 </Project>

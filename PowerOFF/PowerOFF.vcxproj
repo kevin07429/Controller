@@ -149,6 +149,7 @@
     <None Include="..\Server\bp_terminal.py" />
     <None Include="..\Server\core.py" />
     <None Include="..\Server\systemd_example.service" />
+    <None Include="..\Server\ui.py" />
     <None Include="Decrypt.py" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

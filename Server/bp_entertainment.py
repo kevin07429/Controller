@@ -1,5 +1,9 @@
 from flask import Blueprint, render_template_string, session, redirect, url_for, request, jsonify
 from core import clients_db, save_db, encrypt_data, decrypt_data, add_cmd_to_queue, init_client_queue
+try:
+    from ui import ADMIN_CSS
+except Exception:
+    ADMIN_CSS = ""
 
 bp = Blueprint('entertainment', __name__)
 
@@ -52,89 +56,85 @@ def entertainment_page(mac):
 
     HTML = """
     <!DOCTYPE html>
-    <html lang="zh-CN">
+    <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
         <title>娱乐控制 - {{ info.name }}</title>
         <style>
-            body { font-family: Arial, sans-serif; background: #f4f6f9; margin: 0; padding: 20px; }
-            .container { max-width: 600px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
-            h2 { margin-top: 0; color: #333; font-size: 24px; border-bottom: 2px solid #eee; padding-bottom: 10px;}
-            .btn { display: inline-block; padding: 12px 18px; margin: 8px 5px; color: #fff; background: #007bff; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; font-size: 15px; font-weight: bold; transition: background 0.3s; }
-            .btn:hover { background: #0056b3; }
-            .btn-danger { background: #dc3545; }
-            .btn-danger:hover { background: #c82333; }
-            .btn-success { background: #28a745; }
-            .btn-success:hover { background: #218838; }
-            .btn-warning { background: #ffc107; color: #000; }
-            .btn-warning:hover { background: #e0a800; }
-            .btn-info { background: #17a2b8; }
-            .btn-info:hover { background: #138496; }
-            .btn-info.active { background: #ff6b6b; animation: pulse 0.5s infinite; }
+            {{ admin_css|safe }}
+            body { background:var(--bg); margin:0; padding:0; }
+            .container { max-width:860px; }
+            .media-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+            .btn { margin:4px; }
+            .btn-info.active { background:#ef4444; animation:pulse .5s infinite; }
             @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
-            .header-link { margin-bottom: 20px; display: inline-block; text-decoration: none; color: #007bff; font-weight: bold; }
-            .header-link:hover { text-decoration: underline; }
-            .section { border-top: 1px solid #eee; padding-top: 20px; margin-top: 20px; }
-            .section p { color: #666; font-size: 14px; margin-bottom: 15px; }
-            .status-text { color: green; font-size: 13px; margin-top: 10px; display: none; }
-            .media-now-playing { background: #e9ecef; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: center; }
-            .media-title { font-size: 18px; font-weight: bold; color: #333; margin-top: 8px; }
-            .volume-slider-container { display: flex; align-items: center; margin-top: 15px; }
-            input[type=range] { flex-grow: 1; margin: 0 15px; }
-            .vol-value { font-weight: bold; min-width: 40px; }
+            .header-link { display:inline-block; margin-bottom:12px; }
+            .section { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; }
+            .section h3 { margin-bottom:6px; }
+            .section p { color:var(--muted); font-size:13px; margin:0 0 12px; }
+            .status-text { color:var(--green); font-size:13px; margin-top:12px; display:none; font-weight:700; }
+            .media-now-playing { background:#f8fafc; border:1px solid var(--line); padding:16px; border-radius:8px; margin-bottom:12px; text-align:center; }
+            .media-title { font-size:20px; font-weight:700; color:var(--text); margin-top:6px; word-break:break-word; }
+            .volume-slider-container { display:flex; align-items:center; gap:10px; margin:12px 0; }
+            input[type=range] { flex:1; min-width:120px; accent-color:var(--blue); }
+            .vol-value { font-weight:700; min-width:32px; }
+            @media(max-width:720px){ .media-grid{grid-template-columns:1fr}.container{margin:0}.section .btn{width:100%;margin:4px 0}.volume-slider-container{flex-wrap:wrap} }
         </style>
     </head>
     <body>
+        <main class="shell">
         <div class="container">
-            <a href="/" class="header-link">← 返回控制台主页</a>
-            <h2>🎮 娱乐遥控器 - {{ info.name }}</h2>
-            <div style="color:#888; font-size:13px; margin-top:-10px; margin-bottom:20px;">设备 MAC: {{ mac }}</div>
-
-            <div class="media-now-playing">
-                <div style="color: #666; font-size: 12px;">🎵 当前正在播放媒体 / 音乐</div>
-                <div class="media-title" id="song-title">同步中...</div>
+            <div class="header">
+                <div><h2>Media Control</h2><div class="subtle">{{ info.name }} [{{ mac }}]</div></div>
+                <a class="btn muted" href="/">Back</a>
             </div>
 
+            <div class="media-now-playing">
+                <div class="subtle">Now playing</div>
+                <div class="media-title" id="song-title">Syncing...</div>
+            </div>
+
+            <div class="media-grid">
             <div class="section">
-                <h3>🔊 远程音量控制</h3>
-                <p>调节或静音这台电脑当前的系统主音量：</p>
+                <h3>Volume</h3>
+                <p>Adjust or mute the current system volume.</p>
                 <div class="volume-slider-container">
-                    <span>🔈</span>
+                    <span>Volume</span>
                     <input type="range" id="vol-slider" min="0" max="100" value="50" onchange="setVolume(this.value)" oninput="document.getElementById('vol-display').innerText=this.value">
                     <span class="vol-value" id="vol-display">50</span>%
                 </div>
-                <br>
-                <button class="btn btn-danger" onclick="sendVolumeCmd('mute')">🔇 切换系统静音</button>
-                <button class="btn btn-info" id="bounce-btn" onclick="toggleBounceMode()">🎉 蹦迪模式</button>
+                <button class="btn btn-danger" onclick="sendVolumeCmd('mute')">Toggle mute</button>
+                <button class="btn btn-info" id="bounce-btn" onclick="toggleBounceMode()">Volume bounce</button>
             </div>
 
             <div class="section">
-                <h3>🎵 媒体播放遥控</h3>
-                <p>控制系统主流音乐或视频播放器（如网易云音乐、QQ音乐、B站客户端等）：</p>
-                <button class="btn" onclick="sendMediaCmd('playpause')">⏯ 播放 / 暂停</button>
-                <button class="btn" onclick="sendMediaCmd('prev')">⏮ 上一首</button>
-                <button class="btn" onclick="sendMediaCmd('next')">⏭ 下一首</button>
+                <h3>Media Playback</h3>
+                <p>Control common system media keys.</p>
+                <button class="btn" onclick="sendMediaCmd('playpause')">Play / Pause</button>
+                <button class="btn" onclick="sendMediaCmd('prev')">Previous</button>
+                <button class="btn" onclick="sendMediaCmd('next')">Next</button>
             </div>
 
             <div class="section">
-                <h3>📱 短视频遥控（抖音等）</h3>
-                <p>通过模拟常见快捷键控制短视频客户端（需客户端窗口在前台）：</p>
-                <button class="btn" onclick="sendShortVideoCmd('playpause')">⏯ 暂停 / 继续（空格）</button>
-                <button class="btn" onclick="sendShortVideoCmd('next')">⏭ 下一条（↓）</button>
-                <button class="btn" onclick="sendShortVideoCmd('prev')">⏮ 上一条（↑）</button>
+                <h3>Short Video</h3>
+                <p>Send common keyboard navigation keys to the active app.</p>
+                <button class="btn" onclick="sendShortVideoCmd('playpause')">Pause / Resume</button>
+                <button class="btn" onclick="sendShortVideoCmd('next')">Next item</button>
+                <button class="btn" onclick="sendShortVideoCmd('prev')">Previous item</button>
             </div>
 
             <div class="section">
-                <h3>💻 屏幕电源控制</h3>
-                <p>远程控制显示器电源状态，防止长时间挂机烧屏：</p>
-                <button class="btn btn-warning" onclick="sendCustomCmd('F_CMD:MONITOR_OFF:')">💤 关闭显示器</button>
-                <button class="btn btn-success" onclick="sendCustomCmd('F_CMD:MONITOR_ON:')">☀️ 唤醒显示器</button>
-                <button class="btn btn-info" id="monitor-bounce-btn" onclick="toggleMonitorBounceMode()">🎆 显示器蹦迪</button>
+                <h3>Display Power</h3>
+                <p>Turn the display off or wake it remotely.</p>
+                <button class="btn btn-warning" onclick="sendCustomCmd('F_CMD:MONITOR_OFF:')">Display off</button>
+                <button class="btn btn-success" onclick="sendCustomCmd('F_CMD:MONITOR_ON:')">Wake display</button>
+                <button class="btn btn-info" id="monitor-bounce-btn" onclick="toggleMonitorBounceMode()">Display bounce</button>
+            </div>
             </div>
 
-            <div id="status-msg" class="status-text">指令已下发！</div>
-            <div id="status-error" class="status-text" style="color: red; display: none;">指令投递失败，请稍后重试！</div>
+            <div id="status-msg" class="status-text">Command sent.</div>
+            <div id="status-error" class="status-text" style="color:red;display:none;">Command failed.</div>
 
             <script>
                 let bounceMode = false;
@@ -292,11 +292,12 @@ def entertainment_page(mac):
                 }
 
                 // trigger loop
-                setInterval(pollInfo, 4000);
+                setInterval(pollInfo, 10000);
                 pollInfo();
             </script>
         </div>
+        </main>
     </body>
     </html>
     """
-    return render_template_string(HTML, mac=mac, info=info)
+    return render_template_string(HTML, admin_css=ADMIN_CSS, mac=mac, info=info)

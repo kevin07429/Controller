@@ -2,6 +2,10 @@ from flask import Blueprint, request, render_template_string, session, redirect,
 from datetime import datetime
 import os, time, json, threading
 from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE
+try:
+    from ui import ADMIN_CSS
+except Exception:
+    ADMIN_CSS = ""
 
 bp = Blueprint('taskmgr', __name__)
 
@@ -12,49 +16,48 @@ def taskmgr_page(mac):
 
     TASKMGR_HTML = r"""
     <!DOCTYPE html>
-    <html lang="zh-CN">
+    <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
         <title>任务管理器 - {{ info.name }} ({{ mac }})</title>
         <style>
-            body { background: #f0f2f5; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; padding: 10px; margin: 0; }
-            .header { border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-bottom: 10px; display: flex; flex-direction: column; }
-            .header a { margin-top: 10px; color: #007bff; text-decoration: none; }
-            .tabs { margin-bottom: 15px; display: flex; flex-wrap: wrap; gap: 5px; }
-            .tabs button { padding: 8px 15px; cursor: pointer; border: 1px solid #ccc; background: #e9ecef; border-radius: 4px; font-weight: bold; flex-grow: 1; }
-            .tabs button.active { background: #007bff; color: white; border-color: #007bff; }
-            .table-responsive { overflow-x: auto; }
-            table { width: 100%; border-collapse: collapse; background: white; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); font-size: 14px; min-width: 600px; }
-            th, td { padding: 8px; border-bottom: 1px solid #ddd; text-align: left; }
-            th { background: #f8f9fa; position: sticky; top: 0; }
-            tr:hover { background: #e2e6ea; }
-            #loading { color: red; font-weight: bold; display: none; margin-left: 15px; }
-            .btn-danger { background: #dc3545; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; }
-            .btn-success { background: #28a745; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; }
-            .content-wrapper { height: calc(100vh - 120px); overflow-y: auto; }
-            .metric-box { background: white; padding: 15px; border-radius: 5px; margin-bottom: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); display: inline-block; width: 45%; margin-right: 2%; vertical-align: top;}
-            .metric-title { font-size: 18px; color: #555; }
-            .metric-value { font-size: 28px; font-weight: bold; color: #007bff; margin-top: 10px; }
+            {{ admin_css|safe }}
+            body { background:var(--bg); padding:0; }
+            .tabs { background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:12px; }
+            .tabs button { border:1px solid var(--line); background:#fff; color:#344054; flex:0 1 auto; }
+            .tabs button.active { background:var(--blue); color:#fff; border-color:var(--blue); }
+            .table-responsive { overflow-x:auto; border:1px solid var(--line); border-radius:8px; background:#fff; }
+            table { font-size:13px; min-width:720px; margin:0; }
+            th { position:sticky; top:0; z-index:1; }
+            tr:hover { background:#f8fafc; }
+            #loading { color:var(--amber); font-weight:700; display:none; margin-left:10px; }
+            .content-wrapper { max-height:calc(100vh - 178px); overflow:auto; border-radius:8px; }
+            .metric-box { background:#fff; border:1px solid var(--line); padding:16px; border-radius:8px; margin:0 10px 12px 0; box-shadow:0 1px 2px rgba(15,23,42,.04); display:inline-block; width:calc(50% - 14px); vertical-align:top; }
+            .metric-title { font-size:14px; color:var(--muted); }
+            .metric-value { font-size:28px; font-weight:700; color:var(--blue); margin-top:8px; }
+            @media(max-width:700px){ .metric-box{width:100%;margin-right:0}.tabs button{flex:1 1 calc(50% - 8px)}.content-wrapper{max-height:none} }
         </style>
     </head>
     <body>
+        <main class="shell">
         <div class="header">
-            <span>📊 {{ info.name }} [{{ mac }}] - 远程任务管理器 <span id="conn_status"></span> <span id="loading">加载中...</span></span>
-            <a href="/">[ 返回设备列表 ]</a>
+            <div><h2>Task Manager</h2><div class="subtle">{{ info.name }} [{{ mac }}] <span id="conn_status"></span> <span id="loading">Loading...</span></div></div>
+            <a class="btn muted" href="/">Back</a>
         </div>
         <div class="tabs">
-            <button id="tab_proc" class="active" onclick="switchTab('proc')">进程</button>
-            <button id="tab_perf" onclick="switchTab('perf')">性能</button>
-            <button id="tab_startup" onclick="switchTab('startup')">启动应用</button>
-            <button id="tab_software" onclick="switchTab('software')">已装软件</button>
-            <button id="tab_svc" onclick="switchTab('svc')">服务</button>
-            <button onclick="refreshCurrentTab()" style="background:#17a2b8; color:white; border:none; float:right;">↻ 刷新当前页面</button>
+            <button id="tab_proc" class="active" onclick="switchTab('proc')">Processes</button>
+            <button id="tab_perf" onclick="switchTab('perf')">Performance</button>
+            <button id="tab_startup" onclick="switchTab('startup')">Startup</button>
+            <button id="tab_software" onclick="switchTab('software')">Software</button>
+            <button id="tab_svc" onclick="switchTab('svc')">Services</button>
+            <button class="muted" onclick="refreshCurrentTab()">Refresh</button>
         </div>
 
         <div class="content-wrapper" id="content_area">
             <!-- Content dynamically generated -->
         </div>
+        </main>
 
         <script>
             function checkPing() {
@@ -421,6 +424,6 @@ def taskmgr_page(mac):
     </body>
     </html>
     """
-    return render_template_string(TASKMGR_HTML, mac=mac, info=clients_db[mac])
+    return render_template_string(TASKMGR_HTML, admin_css=ADMIN_CSS, mac=mac, info=clients_db[mac])
 
 # 抽离表格的HTML，供前端 AJAX 每隔几秒拉取实现真正的无感“实时在线状态更新”
