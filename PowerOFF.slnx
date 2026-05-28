@@ -4,4 +4,5 @@
     <Platform Name="x86" />
   </Configurations>
   <Project Path="PowerOFF/PowerOFF.vcxproj" Id="d7a9f6cc-aa7c-469b-a521-61433770c15e" />
+  <Project Path="Updater/Updater.vcxproj" Id="8f1f0498-48cf-48d5-8f67-0c0811561594" />
 </Solution>

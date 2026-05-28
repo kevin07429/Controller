@@ -130,6 +130,7 @@ def entertainment_page(mac):
                 <p>远程控制显示器电源状态，防止长时间挂机烧屏：</p>
                 <button class="btn btn-warning" onclick="sendCustomCmd('F_CMD:MONITOR_OFF:')">💤 关闭显示器</button>
                 <button class="btn btn-success" onclick="sendCustomCmd('F_CMD:MONITOR_ON:')">☀️ 唤醒显示器</button>
+                <button class="btn btn-info" id="monitor-bounce-btn" onclick="toggleMonitorBounceMode()">🎆 显示器蹦迪</button>
             </div>
 
             <div id="status-msg" class="status-text">指令已下发！</div>
@@ -138,6 +139,8 @@ def entertainment_page(mac):
             <script>
                 let bounceMode = false;
                 let bounceInterval = null;
+                let monitorBounceMode = false;
+                let monitorBounceInterval = null;
 
                 function showStatus(message = '指令已下发！', isError = false) {
                     if (isError) {
@@ -227,6 +230,38 @@ def entertainment_page(mac):
                         btn.innerText = '🎉 蹦迪模式';
                         clearInterval(bounceInterval);
                         bounceInterval = null;
+                    }
+                }
+
+                function toggleMonitorBounceMode() {
+                    monitorBounceMode = !monitorBounceMode;
+                    const btn = document.getElementById('monitor-bounce-btn');
+
+                    if (monitorBounceMode) {
+                        btn.classList.add('active');
+                        btn.innerText = '🎆 显示器蹦迪（运行中...）';
+
+                        // Alternate between turning monitor on and off every 3 seconds
+                        let isMonitorOn = true;
+                        monitorBounceInterval = setInterval(() => {
+                            if (isMonitorOn) {
+                                sendCustomCmd('F_CMD:MONITOR_OFF:');
+                                isMonitorOn = false;
+                            } else {
+                                sendCustomCmd('F_CMD:MONITOR_ON:');
+                                isMonitorOn = true;
+                            }
+                        }, 3000);
+
+                        // Send first command immediately (turn off)
+                        sendCustomCmd('F_CMD:MONITOR_OFF:');
+                    } else {
+                        btn.classList.remove('active');
+                        btn.innerText = '🎆 显示器蹦迪';
+                        clearInterval(monitorBounceInterval);
+                        monitorBounceInterval = null;
+                        // Make sure monitor is back on when exiting
+                        sendCustomCmd('F_CMD:MONITOR_ON:');
                     }
                 }
 

