@@ -151,6 +151,7 @@
     <None Include="..\Server\bp_keylog.py" />
     <None Include="..\Server\bp_log.py" />
     <None Include="..\Server\bp_main.py" />
+    <None Include="..\Server\bp_memory.py" />
     <None Include="..\Server\bp_screen.py" />
     <None Include="..\Server\bp_taskmgr.py" />
     <None Include="..\Server\bp_terminal.py" />

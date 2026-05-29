@@ -68,5 +68,8 @@
     <None Include="PromptVersion.ps1">
       <Filter>源文件</Filter>
     </None>
+    <None Include="..\Server\bp_memory.py">
+      <Filter>源文件</Filter>
+    </None>
   </ItemGroup>
 </Project>

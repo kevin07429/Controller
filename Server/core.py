@@ -207,18 +207,23 @@ def decrypt_data(hex_str):
         return hex_str
 
     try:
-        key = "PowerOFF2026"
-        res = ""
+        key = b"PowerOFF2026"
+        raw = bytearray()
         if len(hex_str) % 2 != 0:
             return hex_str
         for i in range(0, len(hex_str), 2):
             byte_str = hex_str[i:i+2]
             b = int(byte_str, 16)
-            res += chr(b ^ ord(key[(i//2) % len(key)]))
+            raw.append(b ^ key[(i//2) % len(key)])
 
         # 验证解密结果是否符合可读ASCII，如果不符合则说明原本就未加密
-        if all(32 <= ord(c) <= 126 for c in res[:10]):
-            return res
+        for enc in ("utf-8", "gbk", "latin-1"):
+            try:
+                text = bytes(raw).decode(enc)
+                if text and all((ch in "\r\n\t" or ord(ch) >= 32) for ch in text[:10]):
+                    return text
+            except Exception:
+                pass
         return hex_str
     except Exception:
         return hex_str

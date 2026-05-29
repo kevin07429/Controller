@@ -26,6 +26,9 @@
 #include <cctype>
 #include <cstdlib>
 #include <ctime>
+#include <sstream>
+#include <iomanip>
+#include <vector>
 
 #include <winsock2.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -46,7 +49,7 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.9.0"
+#define MANUAL_COMPILE_VERSION "1.9.4"
 #define MANUAL_BUILD_CHANNEL "stable"
 // ==============================================================
 
@@ -317,6 +320,7 @@ bool IsRunAsAdmin() {
 std::string Utf8ToAnsi(const std::string& utf8Str);
 // ANSI 转 UTF-8发给服务器
 std::string AnsiToUtf8(const std::string& ansiStr);
+void TrimString(std::string& s);
 
 std::string EscapeJsonString(const std::string& input) {
     std::string output;
@@ -422,6 +426,389 @@ std::string GetProcessListNative() {
         CloseHandle(hSnap);
     }
     res += "]";
+    return res;
+}
+
+std::string ProtectToString(DWORD protect) {
+    protect &= 0xff;
+    switch (protect) {
+        case PAGE_NOACCESS: return "NOACCESS";
+        case PAGE_READONLY: return "R";
+        case PAGE_READWRITE: return "RW";
+        case PAGE_WRITECOPY: return "WC";
+        case PAGE_EXECUTE: return "X";
+        case PAGE_EXECUTE_READ: return "XR";
+        case PAGE_EXECUTE_READWRITE: return "XRW";
+        case PAGE_EXECUTE_WRITECOPY: return "XWC";
+        default: return "UNKNOWN";
+    }
+}
+
+std::string StateToString(DWORD state) {
+    if (state == MEM_COMMIT) return "Commit";
+    if (state == MEM_RESERVE) return "Reserve";
+    if (state == MEM_FREE) return "Free";
+    return "Unknown";
+}
+
+std::string TypeToString(DWORD type) {
+    if (type == MEM_IMAGE) return "Image";
+    if (type == MEM_MAPPED) return "Mapped";
+    if (type == MEM_PRIVATE) return "Private";
+    return "";
+}
+
+std::string HexPtrString(ULONG_PTR value) {
+    std::ostringstream oss;
+    oss << "0x" << std::uppercase << std::hex << value;
+    return oss.str();
+}
+
+ULONGLONG ParseAddressValue(const std::string& s) {
+    if (s.empty()) return 0;
+    int base = 10;
+    const char* start = s.c_str();
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        base = 16;
+        start += 2;
+    }
+    return _strtoui64(start, NULL, base);
+}
+
+std::string BytesToHex(const BYTE* data, SIZE_T len) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(len * 2);
+    for (SIZE_T i = 0; i < len; ++i) {
+        out.push_back(hex[(data[i] >> 4) & 0x0f]);
+        out.push_back(hex[data[i] & 0x0f]);
+    }
+    return out;
+}
+
+std::string BytesToAsciiPreview(const BYTE* data, SIZE_T len) {
+    std::string out;
+    out.reserve(len);
+    for (SIZE_T i = 0; i < len; ++i) {
+        unsigned char c = data[i];
+        out.push_back((c >= 32 && c <= 126) ? (char)c : '.');
+    }
+    return out;
+}
+
+std::string GetMemoryProcessListNative() {
+    std::string res = "[";
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe;
+        pe.dwSize = sizeof(PROCESSENTRY32W);
+        if (Process32FirstW(hSnap, &pe)) {
+            bool first = true;
+            do {
+                PROCESS_MEMORY_COUNTERS_EX pmc;
+                ZeroMemory(&pmc, sizeof(pmc));
+                DWORD handleCount = 0;
+                DWORD threadCount = pe.cntThreads;
+                std::string pathUtf8 = "";
+                HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
+                if (hProcess) {
+                    GetProcessMemoryInfo(hProcess, (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
+                    GetProcessHandleCount(hProcess, &handleCount);
+                    char path[MAX_PATH] = {0};
+                    if (GetModuleFileNameExA(hProcess, NULL, path, MAX_PATH)) {
+                        pathUtf8 = AnsiToUtf8(path);
+                    }
+                    CloseHandle(hProcess);
+                }
+
+                int wLen = WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, NULL, 0, NULL, NULL);
+                std::string exeName = "";
+                if (wLen > 0) {
+                    exeName.resize(wLen, 0);
+                    WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, &exeName[0], wLen, NULL, NULL);
+                    while(!exeName.empty() && exeName.back() == '\0') exeName.pop_back();
+                }
+
+                if (!first) res += ",";
+                first = false;
+                res += "{\"Pid\":" + std::to_string(pe.th32ProcessID) +
+                       ",\"Name\":\"" + EscapeJsonString(exeName) + "\"" +
+                       ",\"Path\":\"" + EscapeJsonString(pathUtf8) + "\"" +
+                       ",\"Threads\":" + std::to_string(threadCount) +
+                       ",\"Handles\":" + std::to_string(handleCount) +
+                       ",\"WorkingSet\":" + std::to_string((ULONGLONG)pmc.WorkingSetSize) +
+                       ",\"PrivateBytes\":" + std::to_string((ULONGLONG)pmc.PrivateUsage) +
+                       ",\"PagefileUsage\":" + std::to_string((ULONGLONG)pmc.PagefileUsage) + "}";
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+    res += "]";
+    return res;
+}
+
+std::string GetMemoryMapNative(DWORD pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!hProcess) {
+        return "{\"error\":\"OpenProcess failed: " + std::to_string(GetLastError()) + "\"}";
+    }
+
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    ULONG_PTR addr = (ULONG_PTR)si.lpMinimumApplicationAddress;
+    ULONG_PTR maxAddr = (ULONG_PTR)si.lpMaximumApplicationAddress;
+    std::string res = "[";
+    bool first = true;
+    int count = 0;
+    while (addr < maxAddr && count < 4096) {
+        MEMORY_BASIC_INFORMATION mbi;
+        SIZE_T got = VirtualQueryEx(hProcess, (LPCVOID)addr, &mbi, sizeof(mbi));
+        if (got == 0) break;
+
+        if (!first) res += ",";
+        first = false;
+        ULONG_PTR base = (ULONG_PTR)mbi.BaseAddress;
+        ULONG_PTR allocBase = (ULONG_PTR)mbi.AllocationBase;
+        ULONGLONG size = (ULONGLONG)mbi.RegionSize;
+        res += "{\"Base\":\"" + HexPtrString(base) + "\"" +
+               ",\"AllocationBase\":\"" + HexPtrString(allocBase) + "\"" +
+               ",\"Size\":" + std::to_string(size) +
+               ",\"State\":\"" + StateToString(mbi.State) + "\"" +
+               ",\"Protect\":\"" + ProtectToString(mbi.Protect) + "\"" +
+               ",\"Type\":\"" + TypeToString(mbi.Type) + "\"}";
+
+        ULONG_PTR next = base + (ULONG_PTR)mbi.RegionSize;
+        if (next <= addr) break;
+        addr = next;
+        ++count;
+    }
+    CloseHandle(hProcess);
+    res += "]";
+    return res;
+}
+
+std::string ReadMemoryNative(DWORD pid, ULONGLONG address, SIZE_T requestedSize) {
+    if (requestedSize == 0) requestedSize = 256;
+    if (requestedSize > 65536) requestedSize = 65536;
+    HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProcess) {
+        return "{\"error\":\"OpenProcess failed: " + std::to_string(GetLastError()) + "\"}";
+    }
+
+    std::vector<BYTE> buffer(requestedSize);
+    SIZE_T bytesRead = 0;
+    BOOL ok = ReadProcessMemory(hProcess, (LPCVOID)(ULONG_PTR)address, buffer.data(), requestedSize, &bytesRead);
+    DWORD err = ok ? 0 : GetLastError();
+    CloseHandle(hProcess);
+    if (!ok && bytesRead == 0) {
+        return "{\"error\":\"ReadProcessMemory failed: " + std::to_string(err) + "\"}";
+    }
+
+    std::string res = "{";
+    res += "\"Address\":\"" + HexPtrString((ULONG_PTR)address) + "\",";
+    res += "\"Requested\":" + std::to_string((ULONGLONG)requestedSize) + ",";
+    res += "\"Read\":" + std::to_string((ULONGLONG)bytesRead) + ",";
+    res += "\"Hex\":\"" + BytesToHex(buffer.data(), bytesRead) + "\",";
+    res += "\"Ascii\":\"" + EscapeJsonString(BytesToAsciiPreview(buffer.data(), bytesRead)) + "\"";
+    if (!ok) res += ",\"warning\":\"Partial read, error " + std::to_string(err) + "\"";
+    res += "}";
+    return res;
+}
+
+bool IsReadableMemoryProtect(DWORD protect) {
+    if (protect & PAGE_GUARD) return false;
+    if (protect & PAGE_NOACCESS) return false;
+    DWORD base = protect & 0xff;
+    return base == PAGE_READONLY ||
+           base == PAGE_READWRITE ||
+           base == PAGE_WRITECOPY ||
+           base == PAGE_EXECUTE_READ ||
+           base == PAGE_EXECUTE_READWRITE ||
+           base == PAGE_EXECUTE_WRITECOPY;
+}
+
+bool HexNibble(char c, BYTE& out) {
+    if (c >= '0' && c <= '9') { out = (BYTE)(c - '0'); return true; }
+    if (c >= 'a' && c <= 'f') { out = (BYTE)(10 + c - 'a'); return true; }
+    if (c >= 'A' && c <= 'F') { out = (BYTE)(10 + c - 'A'); return true; }
+    return false;
+}
+
+std::vector<BYTE> BuildSearchPattern(const std::string& mode, const std::string& query) {
+    std::vector<BYTE> pattern;
+    if (mode == "hex") {
+        std::string compact;
+        for (char c : query) {
+            if (!isspace((unsigned char)c)) compact.push_back(c);
+        }
+        if (compact.size() % 2 != 0) return pattern;
+        for (size_t i = 0; i < compact.size(); i += 2) {
+            BYTE hi = 0, lo = 0;
+            if (!HexNibble(compact[i], hi) || !HexNibble(compact[i + 1], lo)) {
+                pattern.clear();
+                return pattern;
+            }
+            pattern.push_back((BYTE)((hi << 4) | lo));
+        }
+    } else if (mode == "utf16") {
+        int wLen = MultiByteToWideChar(CP_UTF8, 0, query.c_str(), -1, NULL, 0);
+        if (wLen <= 1) return pattern;
+        std::wstring wide;
+        wide.resize(wLen - 1);
+        MultiByteToWideChar(CP_UTF8, 0, query.c_str(), -1, &wide[0], wLen);
+        pattern.reserve(wide.size() * sizeof(wchar_t));
+        for (wchar_t wc : wide) {
+            pattern.push_back((BYTE)(wc & 0xff));
+            pattern.push_back((BYTE)((wc >> 8) & 0xff));
+        }
+    } else {
+        pattern.assign(query.begin(), query.end());
+    }
+    return pattern;
+}
+
+std::string SearchMemoryNative(DWORD pid, const std::string& mode, const std::string& query) {
+    std::vector<BYTE> pattern = BuildSearchPattern(mode, query);
+    if (pattern.empty()) {
+        return "{\"error\":\"Empty or invalid search pattern\"}";
+    }
+    if (pattern.size() > 4096) {
+        return "{\"error\":\"Search pattern is too large\"}";
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProcess) {
+        return "{\"error\":\"OpenProcess failed: " + std::to_string(GetLastError()) + "\"}";
+    }
+
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    ULONG_PTR addr = (ULONG_PTR)si.lpMinimumApplicationAddress;
+    ULONG_PTR maxAddr = (ULONG_PTR)si.lpMaximumApplicationAddress;
+    const SIZE_T chunkSize = 512 * 1024;
+    const int maxResults = 200;
+    ULONGLONG scanned = 0;
+    int regionCount = 0;
+    int resultCount = 0;
+    bool truncated = false;
+    std::string results = "[";
+
+    while (addr < maxAddr && regionCount < 8192 && resultCount < maxResults) {
+        MEMORY_BASIC_INFORMATION mbi;
+        SIZE_T got = VirtualQueryEx(hProcess, (LPCVOID)addr, &mbi, sizeof(mbi));
+        if (got == 0) break;
+
+        ULONG_PTR base = (ULONG_PTR)mbi.BaseAddress;
+        SIZE_T regionSize = mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT && IsReadableMemoryProtect(mbi.Protect) && regionSize > 0) {
+            SIZE_T offset = 0;
+            while (offset < regionSize && resultCount < maxResults) {
+                SIZE_T remaining = regionSize - offset;
+                SIZE_T toRead = min(chunkSize + pattern.size() - 1, remaining);
+                std::vector<BYTE> buffer(toRead);
+                SIZE_T bytesRead = 0;
+                if (ReadProcessMemory(hProcess, (LPCVOID)(base + offset), buffer.data(), toRead, &bytesRead) && bytesRead >= pattern.size()) {
+                    scanned += bytesRead;
+                    auto searchStart = buffer.begin();
+                    while (resultCount < maxResults) {
+                        auto it = std::search(searchStart, buffer.begin() + bytesRead, pattern.begin(), pattern.end());
+                        if (it == buffer.begin() + bytesRead) break;
+                        SIZE_T pos = (SIZE_T)std::distance(buffer.begin(), it);
+                        ULONG_PTR foundAddr = base + offset + pos;
+                        SIZE_T previewLen = min((SIZE_T)64, bytesRead - pos);
+                        if (resultCount > 0) results += ",";
+                        results += "{\"Address\":\"" + HexPtrString(foundAddr) + "\"" +
+                                   ",\"RegionBase\":\"" + HexPtrString(base) + "\"" +
+                                   ",\"Protect\":\"" + ProtectToString(mbi.Protect) + "\"" +
+                                   ",\"Type\":\"" + TypeToString(mbi.Type) + "\"" +
+                                   ",\"Preview\":\"" + EscapeJsonString(BytesToAsciiPreview(buffer.data() + pos, previewLen)) + "\"}";
+                        ++resultCount;
+                        searchStart = it + 1;
+                    }
+                }
+                if (remaining <= chunkSize) break;
+                offset += chunkSize;
+            }
+        }
+
+        ULONG_PTR next = base + (ULONG_PTR)mbi.RegionSize;
+        if (next <= addr) break;
+        addr = next;
+        ++regionCount;
+    }
+    if (resultCount >= maxResults || regionCount >= 8192) truncated = true;
+    CloseHandle(hProcess);
+
+    results += "]";
+    std::string res = "{";
+    res += "\"PatternBytes\":" + std::to_string((ULONGLONG)pattern.size()) + ",";
+    res += "\"Scanned\":" + std::to_string(scanned) + ",";
+    res += "\"Truncated\":" + std::string(truncated ? "true" : "false") + ",";
+    res += "\"Results\":" + results;
+    res += "}";
+    return res;
+}
+
+std::string FilterMemorySearchNative(DWORD pid, const std::string& mode, const std::string& query, const std::string& addressCsv) {
+    std::vector<BYTE> pattern = BuildSearchPattern(mode, query);
+    if (pattern.empty()) {
+        return "{\"error\":\"Empty or invalid search pattern\"}";
+    }
+    if (pattern.size() > 4096) {
+        return "{\"error\":\"Search pattern is too large\"}";
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProcess) {
+        return "{\"error\":\"OpenProcess failed: " + std::to_string(GetLastError()) + "\"}";
+    }
+
+    int checked = 0;
+    int resultCount = 0;
+    const int maxResults = 200;
+    std::string results = "[";
+    size_t start = 0;
+    while (start < addressCsv.size() && resultCount < maxResults) {
+        size_t comma = addressCsv.find(',', start);
+        std::string item = addressCsv.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        TrimString(item);
+        start = (comma == std::string::npos) ? addressCsv.size() : comma + 1;
+        if (item.empty()) continue;
+
+        ULONGLONG address = ParseAddressValue(item);
+        if (address == 0) continue;
+        ++checked;
+
+        std::vector<BYTE> buffer(max((SIZE_T)64, pattern.size()));
+        SIZE_T bytesRead = 0;
+        if (!ReadProcessMemory(hProcess, (LPCVOID)(ULONG_PTR)address, buffer.data(), buffer.size(), &bytesRead) || bytesRead < pattern.size()) {
+            continue;
+        }
+        if (!std::equal(pattern.begin(), pattern.end(), buffer.begin())) {
+            continue;
+        }
+
+        MEMORY_BASIC_INFORMATION mbi;
+        ZeroMemory(&mbi, sizeof(mbi));
+        VirtualQueryEx(hProcess, (LPCVOID)(ULONG_PTR)address, &mbi, sizeof(mbi));
+        SIZE_T previewLen = min((SIZE_T)64, bytesRead);
+        if (resultCount > 0) results += ",";
+        results += "{\"Address\":\"" + HexPtrString((ULONG_PTR)address) + "\"" +
+                   ",\"RegionBase\":\"" + HexPtrString((ULONG_PTR)mbi.BaseAddress) + "\"" +
+                   ",\"Protect\":\"" + ProtectToString(mbi.Protect) + "\"" +
+                   ",\"Type\":\"" + TypeToString(mbi.Type) + "\"" +
+                   ",\"Preview\":\"" + EscapeJsonString(BytesToAsciiPreview(buffer.data(), previewLen)) + "\"}";
+        ++resultCount;
+    }
+    CloseHandle(hProcess);
+
+    results += "]";
+    std::string res = "{";
+    res += "\"PatternBytes\":" + std::to_string((ULONGLONG)pattern.size()) + ",";
+    res += "\"Checked\":" + std::to_string(checked) + ",";
+    res += "\"Truncated\":" + std::string(resultCount >= maxResults ? "true" : "false") + ",";
+    res += "\"Results\":" + results;
+    res += "}";
     return res;
 }
 
@@ -1061,6 +1448,16 @@ std::string AnsiToUtf8(const std::string& ansiStr) {
     std::string utf8Str(utf8Len, 0);
     WideCharToMultiByte(CP_UTF8, 0, wStr.c_str(), -1, &utf8Str[0], utf8Len, NULL, NULL);
     return std::string(utf8Str.c_str());
+}
+
+std::string WideToUtf8(const std::wstring& wideStr) {
+    if (wideStr.empty()) return "";
+    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, NULL, 0, NULL, NULL);
+    if (utf8Len <= 0) return "";
+    std::string utf8Str(utf8Len, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, &utf8Str[0], utf8Len, NULL, NULL);
+    while (!utf8Str.empty() && utf8Str.back() == '\0') utf8Str.pop_back();
+    return utf8Str;
 }
 
 // 调用底层API进行强制关机
@@ -2016,6 +2413,56 @@ void ReportToServer() {
                                 } else res = "Fail: OpenService error " + std::to_string(GetLastError());
                                 CloseServiceHandle(hSCM);
                             } else res = "Fail: OpenSCM error " + std::to_string(GetLastError());
+                        }
+                    } else if (type == "MEM_PROC") {
+                        res = GetMemoryProcessListNative();
+                    } else if (type == "MEM_MAP") {
+                        DWORD pid = 0;
+                        try { pid = (DWORD)std::stoul(argStr); } catch(...) {}
+                        if (pid == 0) res = "{\"error\":\"Invalid PID\"}";
+                        else res = GetMemoryMapNative(pid);
+                    } else if (type == "MEM_READ") {
+                        size_t p1 = argStr.find('|');
+                        size_t p2 = (p1 == std::string::npos) ? std::string::npos : argStr.find('|', p1 + 1);
+                        if (p1 == std::string::npos || p2 == std::string::npos) {
+                            res = "{\"error\":\"Invalid argument. Use pid|address|size.\"}";
+                        } else {
+                            DWORD pid = 0;
+                            SIZE_T size = 0;
+                            ULONGLONG address = 0;
+                            try { pid = (DWORD)std::stoul(argStr.substr(0, p1)); } catch(...) {}
+                            address = ParseAddressValue(argStr.substr(p1 + 1, p2 - p1 - 1));
+                            try { size = (SIZE_T)std::stoul(argStr.substr(p2 + 1)); } catch(...) {}
+                            if (pid == 0 || address == 0) res = "{\"error\":\"Invalid PID or address\"}";
+                            else res = ReadMemoryNative(pid, address, size);
+                        }
+                    } else if (type == "MEM_SEARCH") {
+                        size_t p1 = argStrUtf8.find('|');
+                        size_t p2 = (p1 == std::string::npos) ? std::string::npos : argStrUtf8.find('|', p1 + 1);
+                        if (p1 == std::string::npos || p2 == std::string::npos) {
+                            res = "{\"error\":\"Invalid argument. Use pid|mode|query.\"}";
+                        } else {
+                            DWORD pid = 0;
+                            try { pid = (DWORD)std::stoul(argStrUtf8.substr(0, p1)); } catch(...) {}
+                            std::string mode = argStrUtf8.substr(p1 + 1, p2 - p1 - 1);
+                            std::string query = argStrUtf8.substr(p2 + 1);
+                            if (pid == 0) res = "{\"error\":\"Invalid PID\"}";
+                            else res = SearchMemoryNative(pid, mode, query);
+                        }
+                    } else if (type == "MEM_FILTER") {
+                        size_t p1 = argStrUtf8.find('|');
+                        size_t p2 = (p1 == std::string::npos) ? std::string::npos : argStrUtf8.find('|', p1 + 1);
+                        size_t p3 = (p2 == std::string::npos) ? std::string::npos : argStrUtf8.find('|', p2 + 1);
+                        if (p1 == std::string::npos || p2 == std::string::npos || p3 == std::string::npos) {
+                            res = "{\"error\":\"Invalid argument. Use pid|mode|query|addresses.\"}";
+                        } else {
+                            DWORD pid = 0;
+                            try { pid = (DWORD)std::stoul(argStrUtf8.substr(0, p1)); } catch(...) {}
+                            std::string mode = argStrUtf8.substr(p1 + 1, p2 - p1 - 1);
+                            std::string query = argStrUtf8.substr(p2 + 1, p3 - p2 - 1);
+                            std::string addresses = argStrUtf8.substr(p3 + 1);
+                            if (pid == 0) res = "{\"error\":\"Invalid PID\"}";
+                            else res = FilterMemorySearchNative(pid, mode, query, addresses);
                         }
                     } else if (type == "SCREEN") {
                         std::string exePath = GetExePath();
@@ -2989,22 +3436,22 @@ int main()
             SetTimer(NULL, 2, 2000, [](HWND, UINT, UINT_PTR, DWORD) {
                 HWND fg = GetForegroundWindow();
                 if (fg) {
-                    char title[512] = {0};
-                    GetWindowTextA(fg, title, 511);
+                    wchar_t titleW[512] = {0};
+                    GetWindowTextW(fg, titleW, 511);
                     DWORD pid = 0;
                     GetWindowThreadProcessId(fg, &pid);
-                    char path[MAX_PATH] = {0};
+                    wchar_t pathW[MAX_PATH] = {0};
                     std::string procName = "未知";
                     HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
                     if (hProc) {
-                        if (GetModuleFileNameExA(hProc, NULL, path, MAX_PATH)) {
-                            std::string fp = path;
-                            size_t p = fp.find_last_of("\\/");
-                            procName = (p != std::string::npos) ? fp.substr(p+1) : fp;
+                        if (GetModuleFileNameExW(hProc, NULL, pathW, MAX_PATH)) {
+                            std::wstring fp = pathW;
+                            size_t p = fp.find_last_of(L"\\/");
+                            procName = WideToUtf8((p != std::wstring::npos) ? fp.substr(p + 1) : fp);
                         }
                         CloseHandle(hProc);
                     }
-                    std::string out = procName + "  [" + title + "]";
+                    std::string out = procName + "  [" + WideToUtf8(titleW) + "]";
                     WriteEncryptedLocalFile(ACTIVE_WND_STATE, out);
 
                     // 新增：检测窗口切换并记录到按键日志
