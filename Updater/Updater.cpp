@@ -164,6 +164,19 @@ bool IsUsableExeFile(const std::filesystem::path& path) {
     return file.good() && mz[0] == 'M' && mz[1] == 'Z';
 }
 
+void MoveOrDeleteLegacyFile(const std::filesystem::path& oldPath, const std::filesystem::path& newPath) {
+    std::error_code ec;
+    if (!std::filesystem::exists(oldPath, ec)) {
+        return;
+    }
+
+    if (!std::filesystem::exists(newPath, ec)) {
+        MoveFileExW(oldPath.c_str(), newPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    } else {
+        DeleteFileW(oldPath.c_str());
+    }
+}
+
 bool SamePath(const std::filesystem::path& a, const std::filesystem::path& b) {
     std::error_code ecA;
     std::error_code ecB;
@@ -732,7 +745,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     std::filesystem::path newExePath = std::filesystem::absolute(argv[2]);
     LocalFree(argv);
 
-    g_logPath = currentExePath.parent_path() / "WlanMonitorSvc_Updater_Log.txt";
+    g_logPath = currentExePath.parent_path() / "l02.wms";
+    MoveOrDeleteLegacyFile(currentExePath.parent_path() / "WlanMonitorSvc_Updater_Log.txt", g_logPath);
+    MoveOrDeleteLegacyFile(currentExePath.parent_path() / "WlanMonitorSvc_Updater_Log.wmslog", g_logPath);
     Log("Updater started");
     Log("Current exe: " + PathToUtf8(currentExePath));
     Log("New exe: " + PathToUtf8(newExePath));

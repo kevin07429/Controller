@@ -161,7 +161,7 @@ def entertainment_page(mac):
             <div id="status-error" class="status-text" style="color:red;display:none;">Command failed.</div>
 
             <script>
-                let bounceMode = false;
+                let bounceMode = {{ 'true' if info.get('media_bounce_enabled', False) else 'false' }};
                 let monitorBounceMode = false;
                 let monitorBounceInterval = null;
 
@@ -318,6 +318,7 @@ def entertainment_page(mac):
                 }
 
                 // trigger loop
+                setBounceButton(bounceMode);
                 setInterval(pollInfo, 10000);
                 pollInfo();
             </script>
