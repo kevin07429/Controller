@@ -94,6 +94,10 @@ def memory_page(mac):
                         </div>
                         <button class="muted" onclick="loadMap()" id="map-refresh" disabled>Reload map</button>
                     </div>
+                    <div class="mem-tools" style="margin-top:0;margin-bottom:10px">
+                        <label class="small"><input id="map-all-regions" type="checkbox" onchange="loadMap()" disabled> Show all regions</label>
+                        <span id="map-summary" class="small"></span>
+                    </div>
                     <div class="table-wrap">
                         <table>
                             <thead><tr><th class="sortable" onclick="sortMap('Base')">Base</th><th class="sortable" onclick="sortMap('Size')">Size</th><th class="sortable" onclick="sortMap('State')">State</th><th class="sortable" onclick="sortMap('Protect')">Protect</th><th class="sortable" onclick="sortMap('Type')">Type</th><th>Read</th></tr></thead>
@@ -162,6 +166,7 @@ def memory_page(mac):
             let searchSort = { col: 'Address', dir: 1 };
             let lastReadRows = [];
             let lastReadMeta = '';
+            let mapRenderToken = 0;
 
             function fmt(bytes) {
                 bytes = Number(bytes || 0);
@@ -213,25 +218,30 @@ def memory_page(mac):
                 if (polling) return;
                 polling = true;
                 setStatus('Waiting for client...');
+                const useRawResult = cmd.startsWith('F_CMD:MEM_');
                 fetch('/api/file/cmd', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({mac: '{{ mac }}', cmd})
                 }).then(() => {
-                    let tries = 0;
+                    const startedAt = Date.now();
                     const timer = setInterval(() => {
-                        fetch('/api/file/result/{{ mac }}')
-                        .then(r => r.json())
-                        .then(data => {
+                        const resultFetch = useRawResult
+                            ? fetch('/api/file/result_raw/{{ mac }}').then(r => {
+                                if (r.status === 200) return r.text().then(text => ({status: 'ready', data: text}));
+                                if (r.status === 204) return {status: 'waiting'};
+                                throw new Error('HTTP ' + r.status);
+                            })
+                            : fetch('/api/file/result/{{ mac }}').then(r => r.json());
+                        resultFetch.then(data => {
                             if (data.status === 'ready') {
                                 clearInterval(timer);
                                 polling = false;
                                 setStatus('Ready');
                                 callback(data.data || '');
-                            } else if (++tries > 90) {
-                                clearInterval(timer);
-                                polling = false;
-                                setStatus('Timeout');
+                            } else {
+                                const waited = Math.floor((Date.now() - startedAt) / 1000);
+                                setStatus('Waiting for client... ' + waited + 's');
                             }
                         }).catch(err => {
                             clearInterval(timer);
@@ -295,36 +305,60 @@ def memory_page(mac):
                 selectedName = proc.Name || String(pid);
                 document.getElementById('selected-proc').innerHTML = '<span class="selected-title">' + esc(selectedName) + '</span> PID <code>' + pid + '</code>';
                 document.getElementById('map-refresh').disabled = false;
+                document.getElementById('map-all-regions').disabled = false;
                 renderProcesses();
                 loadMap();
             }
 
             function loadMap() {
                 if (!selectedPid) return;
+                const showAll = document.getElementById('map-all-regions').checked;
+                document.getElementById('map-summary').textContent = showAll ? 'Loading full address map...' : 'Loading readable regions...';
                 document.getElementById('map-body').innerHTML = '<tr><td colspan="6" class="empty">Loading...</td></tr>';
-                sendNative('F_CMD:MEM_MAP:' + selectedPid, res => {
+                sendNative('F_CMD:MEM_MAP:' + selectedPid + '|' + (showAll ? 'all' : 'readable'), res => {
                     try {
                         const data = parseJsonPayload(res);
                         if (data.error) throw new Error(data.error);
                         memoryMap = Array.isArray(data) ? data : [];
+                        document.getElementById('map-summary').textContent = (showAll ? 'All regions: ' : 'Readable regions: ') + memoryMap.length;
                         renderMap();
                     } catch(e) {
+                        document.getElementById('map-summary').textContent = '';
                         document.getElementById('map-body').innerHTML = '<tr><td colspan="6"><pre style="color:red;white-space:pre-wrap">' + esc(String(e.message || e)) + '</pre></td></tr>';
                     }
                 });
             }
 
             function renderMap() {
+                const token = ++mapRenderToken;
                 const rows = [...memoryMap].sort((a, b) => compareRows(a, b, mapSort.col) * mapSort.dir);
-                document.getElementById('map-body').innerHTML = rows.map(r => `
-                    <tr>
-                        <td class="mono">${esc(r.Base)}</td>
-                        <td>${fmt(r.Size)}</td>
-                        <td>${esc(r.State)}</td>
-                        <td>${esc(r.Protect)}</td>
-                        <td>${esc(r.Type)}</td>
-                        <td><button class="mini" onclick="prepareRead('${esc(r.Base)}', ${Math.min(Number(r.Size || 256), 4096)})">Read</button></td>
-                    </tr>`).join('') || '<tr><td colspan="6" class="empty">No regions.</td></tr>';
+                const body = document.getElementById('map-body');
+                if (!rows.length) {
+                    body.innerHTML = '<tr><td colspan="6" class="empty">No regions.</td></tr>';
+                    return;
+                }
+                body.innerHTML = '';
+                let index = 0;
+                const batchSize = 160;
+                function appendBatch() {
+                    if (token !== mapRenderToken) return;
+                    const end = Math.min(index + batchSize, rows.length);
+                    let html = '';
+                    for (; index < end; index++) {
+                        const r = rows[index];
+                        html += `<tr>
+                            <td class="mono">${esc(r.Base)}</td>
+                            <td>${fmt(r.Size)}</td>
+                            <td>${esc(r.State)}</td>
+                            <td>${esc(r.Protect)}</td>
+                            <td>${esc(r.Type)}</td>
+                            <td><button class="mini" onclick="prepareRead('${esc(r.Base)}', ${Math.min(Number(r.Size || 256), 4096)})">Read</button></td>
+                        </tr>`;
+                    }
+                    body.insertAdjacentHTML('beforeend', html);
+                    if (index < rows.length) requestAnimationFrame(appendBatch);
+                }
+                requestAnimationFrame(appendBatch);
             }
 
             window.sortMap = function(col) {

