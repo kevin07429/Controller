@@ -7,7 +7,7 @@ app = Flask(__name__)
 app.secret_key = 'super_secret_gardenia_key'
 
 # 增加客户端发包的解析阈值，防止大量文本返回时（如任务列表、文件列表）被 Flask 丢弃
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 允许最大 50MB 的 Payload
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 允许最大 2GB 的 Payload
 
 app.register_blueprint(bp_auth.bp)
 app.register_blueprint(bp_main.bp)

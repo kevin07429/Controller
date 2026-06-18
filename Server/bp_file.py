@@ -1,6 +1,7 @@
 from flask import Blueprint, request, render_template_string, session, redirect, url_for, send_from_directory, jsonify, Response
 from datetime import datetime
 import os, time, json, threading
+from urllib.parse import quote
 from core import clients_db, save_db, is_online, log_login_attempt, USERNAME, PASSWORD, UPDATE_DIR, VERSION_FILE, decrypt_data
 try:
     from ui import ADMIN_CSS
@@ -536,7 +537,9 @@ def server_upload(mac):
         os.makedirs(dest_dir, exist_ok=True)
         safe_name = f.filename.replace('/', '_').replace('\\', '_')
         f.save(os.path.join(dest_dir, safe_name))
-        return jsonify({"status": "ok", "url": f"{request.host_url}uploads/{mac}/{safe_name}"})
+        encoded_mac = quote(mac, safe='')
+        encoded_name = quote(safe_name, safe='')
+        return jsonify({"status": "ok", "url": f"{request.host_url}uploads/{encoded_mac}/{encoded_name}"})
     return jsonify({"status": "error"}), 400
 
 @bp.route('/uploads/<mac>/<path:filename>')
