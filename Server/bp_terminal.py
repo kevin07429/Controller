@@ -56,6 +56,13 @@ def api_send_cmd():
     is_media_info_poll = (cmd == 'F_CMD:MEDIA_INFO:')
     if is_media_info_poll:
         priority = 'low'
+    is_monitor_power_cmd = cmd in ['F_CMD:MONITOR_OFF:', 'F_CMD:MONITOR_ON:']
+    if is_monitor_power_cmd:
+        clients_db[mac]['cmd_queue'] = [
+            item for item in clients_db[mac].get('cmd_queue', [])
+            if str(item.get('cmd', '')) not in ['F_CMD:MONITOR_OFF:', 'F_CMD:MONITOR_ON:']
+        ]
+        priority = 'high'
 
     # 处理 UPDATE_NOW 特殊逻辑
     if cmd == 'UPDATE_NOW':

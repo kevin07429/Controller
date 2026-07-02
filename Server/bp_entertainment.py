@@ -263,6 +263,7 @@ def entertainment_page(mac):
                     const btn = document.getElementById('monitor-bounce-btn');
 
                     if (monitorBounceMode) {
+                        if (monitorBounceInterval) clearInterval(monitorBounceInterval);
                         btn.classList.add('active');
                         btn.innerText = '🎆 显示器蹦迪（运行中...）';
 
